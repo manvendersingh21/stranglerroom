@@ -1,0 +1,26 @@
+{
+ "task_id": "isolation-impl-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "adversarial security + correctness review of the isolation implementation (launcher run as root)",
+ "prompt": "You are an adversarial security reviewer. agents/isolation.py is a launcher that runs AS ROOT and starts each StranglerRoom component (3 Switch agents, a strangler proxy holding a flip token, a legacy and a modern web target) as its own Unix user from a root-owned service area (/srv/stranglerroom: app/ and venv/ mirrors, state/ with per-component private dirs), per docs/ISOLATION.md (revision 2). scripts/agents.sh and scripts/targets.sh call it; Makefile exposes setup/verify/off. Host facts: root has CAP_CHOWN/DAC_OVERRIDE/FOWNER/KILL/SETUID/SETGID but not DAC_READ_SEARCH/SYS_PTRACE/NET_ADMIN; NoNewPrivs=1; yama ptrace_scope=1; fs.protected_symlinks=1 and protected_hardlinks=1; Python 3.12. Assume an attacker controls ONE service uid (e.g. translator-generated code running in the modern server) and can race the launcher. Find concrete ways to: get root (any root write/chown/chmod/unlink/rename that follows an attacker-controlled path, symlink or hard link; TOCTOU between check and use; rmtree/clean/reset traversing attacker dirs; mirror sync writing through attacker-planted entries), read another component's secret (API key copy, the router token in env, the checkout's switch.env/router.token), keep or gain privileges across exec (groups, saved uid, capabilities, fds, session, controlling tty, environment incl. LD_*/PYTHON*), make the scripts accept an unisolated or attacker process as a running component, or make isolation silently turn off. Also find functional defects that would break the live system when isolated (agents cannot connect, modern cannot read the module, uvicorn reload, permissions on files components must write) and verify-checks that would PASS while the property is false. For each finding: severity, file:line, the concrete scenario, the minimal fix. No style nits. Markdown with '## Findings' ('None.' if none) and '## Verdict'.",
+ "outputs": [
+  ".hacp/reviews/isolation-impl.md"
+ ],
+ "context": [
+  "docs/ISOLATION.md",
+  "agents/isolation.py",
+  "scripts/agents.sh",
+  "scripts/targets.sh",
+  "Makefile",
+  "targets/common/router_token.py",
+  "agents/locks.py"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/isolation-impl.md",
+  "grep -q '## Verdict' .hacp/reviews/isolation-impl.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 2400
+}

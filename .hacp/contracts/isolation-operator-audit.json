@@ -1,0 +1,20 @@
+{
+ "task_id": "isolation-operator-audit",
+ "peer": "agy",
+ "model": "gemini-3.8-flash-high",
+ "effort": "high",
+ "summary": "audit the operator-side tools (e2e driver, Makefile, provision, template validator, CI) against the isolation design",
+ "prompt": "Read docs/ISOLATION.md (a design for running each StranglerRoom component as its own Unix user while the operator stays root). Then read scripts/run_e2e_demo.py, scripts/validate_template.py, scripts/bootstrap_switch.sh, agents/provision.py, Makefile and .github/workflows/e2e.yml. List every step of these operator-side tools that would behave differently or break once components run as other users with the state layout of section 2: paths they read or delete that moved (e.g. .state/router.json -> .state/proxy/router.json, .state/divergence_registry.json -> .state/fuzzer/divergence_registry.json, .state/translator_pending_refusals.json -> .state/translator/pending_refusals.json, .state/legacy_openlibrary.log -> .state/legacy/legacy_openlibrary.log), files they write that a component must then read (ownership/mode), processes they signal, logs they read, and anything in CI (which runs as a non-root user with no marker, so isolation must stay off). Cite file:line for each item and give the minimal fix. Write the result to .hacp/reviews/isolation-operator-audit.md with sections '## Findings' ('None.' if none) and '## Verdict'. Do not modify any other file.",
+ "outputs": [
+  ".hacp/reviews/isolation-operator-audit.md"
+ ],
+ "context": [
+  "docs/ISOLATION.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/isolation-operator-audit.md",
+  "grep -q '## Verdict' .hacp/reviews/isolation-operator-audit.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

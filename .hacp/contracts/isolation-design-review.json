@@ -1,0 +1,30 @@
+{
+ "task_id": "isolation-design-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "adversarial security review of the per-component OS-user isolation design",
+ "prompt": "You are an adversarial security reviewer. docs/ISOLATION.md is the design for running each StranglerRoom component (3 Switch agents, a strangler proxy whose POST /_router/flip needs a token, a legacy and a modern web target) as its own Unix user on one Linux host (container: root has CAP_SETUID/SETGID/CHOWN/DAC_OVERRIDE/FOWNER, NoNewPrivs=1, yama ptrace_scope=1, no CAP_NET_ADMIN so no firewall; the repo lives under /root which is 0700). The rest of the context is the current code the design changes. Assume an attacker fully controls ONE component's uid (e.g. through translator-generated code running in the modern server, or a compromised agent). Find concrete ways it could still: read another component's API key, the router token, switch.env (which holds the human lead's Mattermost password and the gateway admin password) or the Mattermost/Switch DB passwords; flip the proxy; impersonate the human or another agent; tamper with another component's state or the production lock; escalate to root through the launcher's prepare step (symlinks, hard links, TOCTOU, rename races in directories it can write), the environment allow-list, inherited file descriptors, argv, /proc, signals; or break the design's own invariants (pid files naming the real process, never silently running unisolated, the setup step's /root permission change exposing other files). Also flag design gaps that would break the live system when isolated (files a component needs but cannot reach). For each finding: severity, the exact scenario, and the minimal design fix. No style nits. Markdown with '## Findings' ('None.' if none) and '## Verdict'.",
+ "outputs": [
+  ".hacp/reviews/isolation-design.md"
+ ],
+ "context": [
+  "docs/ISOLATION.md",
+  "targets/common/router_token.py",
+  "agents/locks.py",
+  "agents/runtime.py",
+  "scripts/agents.sh",
+  "scripts/targets.sh",
+  "targets/proxy/router.py",
+  "targets/modern_fastapi/server.py",
+  "Makefile",
+  "agents/switch_client.py",
+  "agents/translator_agent.py"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/isolation-design.md",
+  "grep -q '## Verdict' .hacp/reviews/isolation-design.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

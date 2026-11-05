@@ -1,0 +1,24 @@
+{
+  "task_id": "isolation-design-review",
+  "session": "s-isolation-design-review-03f181",
+  "ledger": ".hacp/sessions/s-isolation-design-review-03f181.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-isolation-design-review-03f181",
+  "revision": "c72499b2094f37e0f64792e74713b4d8c98b3266ff6456b64604751cd9bc244a",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/isolation-design.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/isolation-design.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/isolation-design.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

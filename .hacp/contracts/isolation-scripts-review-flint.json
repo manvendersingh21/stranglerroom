@@ -1,0 +1,22 @@
+{
+ "task_id": "isolation-scripts-review-flint",
+ "peer": "opencode",
+ "model": "opencode/flint-40b-free",
+ "effort": "high",
+ "summary": "review of the isolation changes in the launch scripts",
+ "prompt": "Review scripts/agents.sh and scripts/targets.sh (bash; they start StranglerRoom components, and with isolation on they launch each one through `python -m agents.isolation exec <name> --` so it runs as its own Unix user; see docs/ISOLATION.md section 4 'Scripts'). Check: the mode is decided before any file is touched; a component is accepted as running only when it really runs isolated (isolated_pid, isolated_listener); a launch that does not come up isolated is killed with its children; stop never signals a process that is not ours except the service users' strays; --fresh resets every file the processes actually use; quoting, `set -euo pipefail` pitfalls (unset variables, failing command substitutions, pipelines), pid reuse, races between concurrent invocations (flock), and that with isolation off the behaviour is exactly the old one. tests/test_targets_sh.py extracts svc/stop_one/is_target_pid/port_open/ports_free verbatim and runs them with only ROOT/RUN/PY set. For each defect: severity, file:line, concrete scenario, minimal fix. Write .hacp/reviews/isolation-scripts.md with '## Findings' ('None.' if none) and '## Verdict'. Do not modify any other file.",
+ "outputs": [
+  ".hacp/reviews/isolation-scripts.md"
+ ],
+ "context": [
+  "docs/ISOLATION.md",
+  "scripts/agents.sh",
+  "scripts/targets.sh"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/isolation-scripts.md",
+  "grep -q '## Verdict' .hacp/reviews/isolation-scripts.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 2400
+}

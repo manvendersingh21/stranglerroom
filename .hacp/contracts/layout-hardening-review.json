@@ -1,0 +1,21 @@
+{
+ "task_id": "layout-hardening-review",
+ "peer": "opencode",
+ "model": "opencode/big-pickle",
+ "effort": "high",
+ "summary": "adversarial review of the state-layout + hardening changes for per-component isolation",
+ "prompt": "You are an adversarial senior reviewer. tmp_review/layout_hardening.diff is a change set (read it, then read the touched files in full where needed) that prepares StranglerRoom for running each component as its own Unix user (design: docs/ISOLATION.md). It: moves each component's runtime files into its own state directory (honouring STRANGLER_STATE_DIR at call time), publishes the translator's generated module 0644, writes agent API-key files via mkstemp (0600 from creation), adds Settings.load_agent() so agents never load the registration token/admin/human secrets, makes the proxy app lazy so importing it touches no state, strips Mattermost/Gateway session cookies in the proxy, publishes room.json atomically as 0644, and hardens bootstrap_switch.sh's secret files. Find real defects: wrong or inconsistent default paths (including any code path still using an old .state/<file> location or reading STRANGLER_STATE_DIR inconsistently), a secret written to a file others can read even briefly, races in the atomic writes, cookie parsing that leaks a credential cookie or corrupts other cookies, the lazy proxy app breaking uvicorn or tests, tests that would pass if the code were wrong. For each finding: severity, file:line, the concrete failing scenario, the minimal fix. No style nits. Write Markdown to .hacp/reviews/layout-hardening.md with '## Findings' ('None.' if none) and '## Verdict'. Do not modify any other file.",
+ "outputs": [
+  ".hacp/reviews/layout-hardening.md"
+ ],
+ "context": [
+  "tmp_review/layout_hardening.diff",
+  "docs/ISOLATION.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/layout-hardening.md",
+  "grep -q '## Verdict' .hacp/reviews/layout-hardening.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

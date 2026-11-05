@@ -1,0 +1,24 @@
+{
+ "task_id": "isolation-round3-rereview",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "re-review of the isolation round-3 fixes",
+ "prompt": "You are an adversarial security reviewer doing a RE-REVIEW of tmp_review/iso_round3.diff, the third fix round of the root launcher in agents/isolation.py (full module provided) and its scripts. It addresses your previous review (.hacp/reviews/isolation-round2.md) and a 14-finding Claude review: canonical IP-literal URLs (check_ip_url), a fixed root-only PATH with the LLM CLI pinned to an absolute checked path, refusing fs.suid_dumpable=1 and re-setting PR_SET_DUMPABLE after the uid change, a fail-closed session keyring join, a single component queue for mirror-link resolution, process inventory by tracked pid plus ppid descendants for every service-uid process, listener expectations from the effective URLs, an iterative fd-based scan walker with streamed large files and FAILing caps, an iterative fd-based tree remover (remove_tree_at) replacing shutil.rmtree in clean/purge/mirror sync, per-entry error handling in clean/reset, a bounded pkill -u loop that waits for exits, stop/status in unknown mode, --fresh path resolution, status acceptance checks, a STRANGLER_SERVICE_USER_PREFIX test seam. Verify each fix is correct and complete and hunt for regressions: any root unlink/rmdir/open in remove_tree_at or the walkers that can follow an attacker-swapped entry (race between fstat identity check and unlinkat/rmdir), loops that can be made infinite or unbounded by a service uid, the prefix seam being abusable (who controls it?), canonicalisation that changes meaning, the dumpability window, and anything that would break the live isolated run. For each finding: severity, file:line, concrete scenario, minimal fix. No style nits. Markdown with '## Findings' ('None.' if none) and '## Verdict'.",
+ "outputs": [
+  ".hacp/reviews/isolation-round3.md"
+ ],
+ "context": [
+  "tmp_review/iso_round3.diff",
+  "agents/isolation.py",
+  "scripts/agents.sh",
+  "scripts/targets.sh",
+  ".hacp/reviews/isolation-round2.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/isolation-round3.md",
+  "grep -q '## Verdict' .hacp/reviews/isolation-round3.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 2400
+}

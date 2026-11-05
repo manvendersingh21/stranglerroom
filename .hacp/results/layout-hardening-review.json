@@ -1,0 +1,11 @@
+{
+  "task_id": "layout-hardening-review",
+  "session": "s-layout-hardening-review-acb898",
+  "ledger": ".hacp/sessions/s-layout-hardening-review-acb898.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-layout-hardening-review-acb898",
+  "revision": "a4096100b09d9c366e5dbf9000287dd3958112feda33953f0e0be4a760d047e5",
+  "verdict": "escalated",
+  "merged": [],
+  "conflicts": [],
+  "peer_error": "quota exhausted: \u001b[0m\n> build \u00b7 big-pickle\n\u001b[91m\u001b[1mError: \u001b[0mFree usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.\n"
+}
