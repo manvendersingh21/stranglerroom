@@ -4,7 +4,8 @@
   with every explicit override still winning;
 * the published ``lists.py`` is 0644 whatever the umask (the modern server runs as another user);
 * ``AgentCredentials.save`` never puts the API key in a file with group/other bits and never leaves a temp file;
-* ``Settings.load_agent`` needs only ``SWITCH_URL`` and survives an unreadable ``switch.env``;
+* ``Settings.load_agent`` needs only ``SWITCH_URL`` (environment, else the public ``connection.env``) and never
+  opens ``switch.env``;
 * a ``RoomAgent`` with no settings uses ``Settings.load_agent``.
 
 Every file written here is under ``tmp_path``: never the real ``.state``, the real ``app/lists.py`` or a port.
@@ -266,32 +267,37 @@ def test_load_agent_needs_no_secrets(state, no_switch_env):
     assert settings.switch_url == sc.DEFAULT_SWITCH_URL and _secretless(settings)
 
 
-def test_load_agent_reads_only_switch_url_from_the_file(state, no_switch_env, monkeypatch):
+def test_load_agent_reads_switch_url_from_the_public_connection_env(state, no_switch_env, monkeypatch):
     state.mkdir(parents=True)
-    (state / "switch.env").write_text("SWITCH_URL=http://switch.example:18000/\nAGENT_REGISTRATION_TOKEN=reg\n"
+    (state / "connection.env").write_text("SWITCH_URL=http://switch.example:18000/\nMATTERMOST_URL=http://mm:1\n")
+    (state / "switch.env").write_text("SWITCH_URL=http://wrong.example:9/\nAGENT_REGISTRATION_TOKEN=reg\n"
                                       "GATEWAY_ADMIN_PASSWORD=admin\nMATTERMOST_USER_PASSWORD=human\n")
     settings = Settings.load_agent()
     assert settings.switch_url == "http://switch.example:18000" and _secretless(settings)
-    monkeypatch.setenv("SWITCH_URL", "http://env.example:1")
+    monkeypatch.setenv("SWITCH_URL", "http://env.example:1")   # the environment wins (the isolation launcher sets it)
     assert Settings.load_agent().switch_url == "http://env.example:1"
 
 
-def test_load_agent_tolerates_an_unreadable_switch_env(state, no_switch_env, monkeypatch):
+def test_load_agent_never_opens_switch_env(state, no_switch_env, monkeypatch):
+    """The privileged file is never read into an agent process, not even when it is readable (codex review #5)."""
+    import builtins
+
     state.mkdir(parents=True)
-    env_file = state / "switch.env"
-    env_file.write_text("SWITCH_URL=http://switch.example:18000\n")
-    real_read_text = Path.read_text
+    (state / "switch.env").write_text("SWITCH_URL=http://switch.example:18000\nAGENT_REGISTRATION_TOKEN=reg\n")
 
-    def read_text(self, *a, **kw):
-        if self == env_file:   # root bypasses file modes: simulate what an isolated agent gets
-            raise PermissionError(13, "Permission denied", str(self))
-        return real_read_text(self, *a, **kw)
+    def guard(original):
+        def wrapper(target, *a, **kw):
+            if "switch.env" in str(target):
+                raise AssertionError(f"an agent touched {target}")
+            return original(target, *a, **kw)
+        return wrapper
 
-    monkeypatch.setattr(Path, "read_text", read_text)
-    settings = Settings.load_agent()
+    for name in ("read_text", "read_bytes", "open", "is_file", "exists", "stat"):
+        monkeypatch.setattr(Path, name, guard(getattr(Path, name)))
+    monkeypatch.setattr(builtins, "open", guard(builtins.open))
+    monkeypatch.setattr(os, "open", guard(os.open))
+    settings = Settings.load_agent()          # no connection.env, no SWITCH_URL: the default, never switch.env
     assert settings.switch_url == sc.DEFAULT_SWITCH_URL and _secretless(settings)
-    monkeypatch.setenv("SWITCH_URL", "http://env.example:1")   # the launcher passes it in the environment
-    assert Settings.load_agent().switch_url == "http://env.example:1"
 
 
 def test_load_agent_propagates_other_errors(state, no_switch_env, monkeypatch):

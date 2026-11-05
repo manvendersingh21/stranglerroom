@@ -155,16 +155,13 @@ class Settings:
     def load_agent(cls) -> "Settings":
         """Settings for a room agent, which needs only ``SWITCH_URL`` (it authenticates with its own API key).
 
-        ``SWITCH_URL`` comes from the environment, else from ``switch.env`` if this process may read it, else
-        :data:`DEFAULT_SWITCH_URL`. The registration token, gateway admin credentials and Mattermost password are
-        never loaded (they stay empty strings): an isolated agent cannot read ``switch.env`` at all
-        (``PermissionError`` is tolerated; any other error propagates)."""
+        ``SWITCH_URL`` comes from the environment, else from the public ``connection.env`` that bootstrap writes next
+        to ``switch.env`` (URLs only, mode 0644), else :data:`DEFAULT_SWITCH_URL`. An agent never opens
+        ``switch.env``: the registration token, the gateway admin credentials and the human's Mattermost password
+        are never read into an agent process (the fields stay empty strings)."""
         url = (os.environ.get("SWITCH_URL") or "").strip()
         if not url:
-            try:
-                url = read_env_file(STATE_DIR / "switch.env").get("SWITCH_URL", "").strip()
-            except PermissionError:
-                log.debug("switch.env is not readable by this user; using the default SWITCH_URL")
+            url = read_env_file(STATE_DIR / "connection.env").get("SWITCH_URL", "").strip()
         return cls(switch_url=(url or DEFAULT_SWITCH_URL).rstrip("/"), registration_token="", admin_email="",
                    admin_password="", mattermost_url="", mattermost_team="", mattermost_user="",
                    mattermost_user_password="")

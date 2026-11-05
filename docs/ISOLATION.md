@@ -51,7 +51,8 @@ forwarding.
 Every file a component writes lives in that component's own directory. Paths honour `STRANGLER_STATE_DIR`.
 
 ```
-.state/  switch.env  router.token  room.json  production.lock  agents/<name>.json  run/
+.state/  switch.env (0600)  connection.env (URLs only, 0644)  router.token  room.json  production.lock
+         agents/<name>.json  run/
          translator/pending_refusals.json   fuzzer/divergence_registry.json
          proxy/router.json                  legacy/legacy_openlibrary.log
 ```

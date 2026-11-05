@@ -25,9 +25,9 @@ Everything below marked **(live-verified)** was exercised against the running Sw
 ### `agents/switch_client.py`
 `Settings.load()` (env, then `.state/switch.env`): `switch_url, registration_token, admin_email, admin_password,
 mattermost_url, mattermost_team, mattermost_user, mattermost_user_password` — for provisioning, template validation and
-the demo driver. `Settings.load_agent()` is what a room agent uses: only `switch_url` (env `SWITCH_URL`, else
-`switch.env` if readable — an isolated agent cannot read it, see docs/ISOLATION.md — else `http://localhost:18000`);
-the other fields are empty strings, and no agent path reads them.
+the demo driver. `Settings.load_agent()` is what a room agent uses: only `switch_url` (env `SWITCH_URL`, else the
+public `.state/connection.env` that bootstrap writes beside `switch.env` — URLs only, mode 0644 — else
+`http://localhost:18000`). It never opens `switch.env`; the other fields are empty strings, and no agent path reads them.
 `register_agent(settings, name, description, display_name) -> AgentCredentials` (reuse stored creds if they still
 authenticate, else `POST /agents` with `overwrite=true`; creds in `.state/agents/<name>.json`, mode 600, written
 via a same-directory `mkstemp` file (0600 from creation) + fsync + `os.replace`).
