@@ -96,8 +96,8 @@ Rules:
 * `auto`: on if and only if the marker exists, is `ready` and names this checkout. A marker that is not `ready` is an
   error (exit 2: "isolation setup incomplete: re-run `make isolate` or `make isolate-off`"). A CI runner or another
   checkout never picks the marker up.
-* `on` without a ready marker for this checkout, or isolation on while the caller is not root: error. Isolation never
-  silently falls back to off.
+* `on` without a ready marker for this checkout is an error, and so is a launch (`exec`) while isolation is on and the
+  caller is not root. Isolation never silently falls back to off.
 * The test suite forces `off` (autouse fixture), so tests never drop privileges, sync mirrors or touch the host.
 
 ## 4. Launcher: `python -m agents.isolation exec <component> -- <python> -m <module> [args…]`
@@ -122,7 +122,8 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
    (argv[0] is discarded), with cwd `SERVICE_HOME/app`. Any other argv shape is refused, and so is a module other than
    the component's own;
 4. builds the environment from **that component's** schema, not from a prefix wildcard:
-   * every component gets `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `PYTHONUNBUFFERED`, `STRANGLER_LOG_LEVEL`;
+   * every component gets `PATH`, `LANG`, `LANGUAGE`, the 13 standard locale variables (`LC_ALL`, `LC_CTYPE`, … — an
+     explicit list, not `LC_*`), `TZ`, `PYTHONUNBUFFERED`, `STRANGLER_LOG_LEVEL`;
    * agents get `STRANGLER_AGENT_PACE`, `LEGACY_URL`, `MODERN_URL`, `PROXY_URL`, and `SWITCH_URL` (from the
      environment, else the checkout's public `connection.env`, else the default; never `switch.env`);
    * the translator also gets `STRANGLER_TRANSLATOR_MODE`, `STRANGLER_LLM_CMD`, and the variables named in
@@ -130,23 +131,31 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
      `STRANGLER_ISOLATION*` or any `switch.env`/Switch `.env` secret there is an error, not a silent skip;
    * the proxy gets `LEGACY_URL` and `MODERN_URL`;
    * the modern server gets `MODERN_NO_RELOAD`;
+   * `SWITCH_URL`, `PROXY_URL`, `LEGACY_URL` and `MODERN_URL` must name an IP literal: `localhost` (which may
+     resolve to `::1`, where any local user can bind a port Switch or a target leaves free) and other names are
+     refused;
    * set last by the launcher, overriding anything above: `STRANGLER_STATE_DIR=SERVICE_HOME/state`,
-     `PYTHONPATH=SERVICE_HOME/app`, `PYTHONDONTWRITEBYTECODE=1`, `HOME` (its private dir), `USER`/`LOGNAME`,
+     `PYTHONPATH=SERVICE_HOME/app`, `PYTHONSAFEPATH=1`, `PYTHONDONTWRITEBYTECODE=1`, `HOME` (its private dir),
+     `USER`/`LOGNAME`,
      `MODERN_LISTS_PATH=SERVICE_HOME/state/module/lists.py` (translator, modern), and `ROUTER_ADMIN_TOKEN`
      (proxy and cutover-gate only), whose value is `resolve_router_token()` evaluated as root, the rule both use
      unisolated;
    * finally removed from every other component: `ROUTER_ADMIN_TOKEN`, `ROUTER_TOKEN_FILE`. A pass-through name
      can never set a launcher-set or forbidden variable;
 5. starts a new session (`setsid`; failure is an error), closes every inherited descriptor except 0, 1 and 2, sets
-   the supplementary groups, gid and uid (real, effective and saved), sets `no_new_privs`, checks that `setuid(0)`
-   now fails and that the permitted, effective and ambient capability sets are empty, sets `umask 077`, changes to
-   `SERVICE_HOME/app` and `execve`s the component. The recorded pid is therefore the component itself.
+   the supplementary groups, gid and uid (real, effective and saved) with the process non-dumpable before and after
+   the switch (so nothing of root's memory is readable while it still holds it), sets `no_new_privs`, checks that
+   `setuid(0)` now fails and that the permitted, effective and ambient capability sets are empty, joins a new session
+   keyring, sets `umask 077`, changes to `SERVICE_HOME/app` and `execve`s the component. The recorded pid is
+   therefore the component itself.
 
 ### Scripts
 
 * The mode is decided once, before any `mkdir`, lock or log; `mode --run-dir DIR` also validates the run directory
   when isolation is on (every path component root-owned and not writable by others unless sticky; the directory
-  itself 0700). Logs are created 0600.
+  itself 0700), creating missing parts descriptor by descriptor from `/`. Logs are created 0600. The marker is
+  read the same way: an ancestor a service could rename is an error, never "off". Once a script has decided
+  "on", it launches with `STRANGLER_ISOLATION=on`, so a marker that disappears in between is an error too.
 * With isolation on, "already running" means a live tracked pid whose four uids are all the component's user and
   whose command line no longer holds `-m agents.isolation`; for a target, its user must also own the listening socket
   (`/proc/net/tcp`). A component found running as another uid, or a healthy port with no tracked isolated process, is
@@ -154,7 +163,8 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
   killed, and `stop` also signals any stray process of the service users (`pkill -u`).
 * `targets.sh start --fresh` with isolation on also runs `python -m agents.isolation reset`. This unlinks
   `proxy/router.json`, `fuzzer/divergence_registry.json` (and `.staging`) and `module/lists.py` in the service area.
-* `make clean-state` with isolation on also runs `python -m agents.isolation clean`, which empties `SERVICE_HOME/state`:
+* `make clean-state` also runs `python -m agents.isolation clean`, whatever the mode, whenever a service area exists (so
+  no API-key copy outlives isolation). It empties `SERVICE_HOME/state`:
   each entry is first renamed inside the root-only `state/`, then removed with the descriptor-based `shutil.rmtree`
   (no path an owner can swap is ever followed). `clean-state` keeps `switch.env` and `connection.env`.
 * The run directory must be root-owned and not group- or other-writable. The default `.state/run` under the 0700
@@ -191,14 +201,20 @@ Exit status 0 only if every check passes; prints one table.
    * `production.lock` read-write ✓ for translator and gate only;
    * create in `module/` ✓ for the translator only.
 3. **Startup smoke:** as each user, the service interpreter imports the component's module. This proves the
-   interpreter, standard library and dependencies are reachable.
-4. **Secret exposure scan:** as each service user, read every reachable regular file under `SERVICE_HOME`, `/tmp`,
+   interpreter, standard library and dependencies are reachable. In LLM mode, the first word of
+   `STRANGLER_LLM_CMD` must resolve for `sr-translator` to an executable whose whole path only root can modify.
+4. **Secret exposure scan:** as each service user (root only lists names; it never opens a candidate, and its walker
+   opens directories with `O_DIRECTORY|O_NOFOLLOW`), read every reachable regular file, symlinks followed in the
+   dropped child with a visited set and caps, under `SERVICE_HOME`, `/tmp`,
    `/var/tmp`, `/dev/shm`, `/etc`, `/home`, `/opt`, `/srv`, `/var/log`, `/var/lib/stranglerroom` and `/root`
    (files over 8 MB are skipped). Search for every secret value: `switch.env` and Switch `.env` passwords, tokens and
    keys, the router token, the three API keys, and the Mattermost database password. Any hit fails, except a user's
    own API key in its own key copy.
-5. **Live processes** (when running; a component that is not running is reported SKIP): each component's uids and
-   groups match its user; each has its own session; signals across components are refused;
+5. **Live processes:** every process running a component module is found from `/proc`, pid file or not. A
+   duplicate, an untracked instance, or one with the wrong uid fails; SKIP means no instance exists. Each
+   component's uids and groups match its user, each has its own session, and signals across components are
+   refused. Every listener on the Switch port and on 9000–9002, in either address family and on any address
+   (`[::1]` and `[::]` included), belongs to the expected uid;
    `ROUTER_ADMIN_TOKEN` is in the environment of proxy and gate only (root lacks `CAP_SYS_PTRACE` here, so each
    process's `/proc/<pid>/environ` is read as that process's own user); no secret value appears in any process's
    command line. A secret shorter than 8 characters cannot be searched for reliably and is reported SKIP.

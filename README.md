@@ -79,14 +79,14 @@ both with attribution.
                    └────────────────────────────┘
 ```
 
-All targets bind `127.0.0.1`. The proxy's routing state is kept in `.state/router.json`.
+All targets bind `127.0.0.1`. The proxy's routing state is kept in `.state/proxy/router.json`; every component writes only inside its own `.state/<component>/` directory.
 
 ## 3. Why Switch is central (and why this is not a chatbot)
 
 | Switch feature | What StranglerRoom uses it for |
 |---|---|
 | **Shared room** `strangler-migration` | Three independent agent processes and one human share a single conversation. Agents hand work to each other with targeted `@mentions` (`send_targeted`), with no orchestrator between them. In `make demo` the driver plays the human: it posts the human's three commands as `user` and checks the results. |
-| **Creator-only room documents** | Each document has exactly one *agent* writer: Switch answers 403 when an agent other than the creator calls `update_room_document`. Other agents can only read it (the `load_internal_documents` op) and mirror it with a sha256 evidence digest. So nothing authenticated as the fuzzer can rewrite the translator's ledger. This local deployment does not isolate the agent processes or their credential files from each other. The proxy's flip endpoint needs a token that has no public default: `ROUTER_ADMIN_TOKEN` if you set one, otherwise a random per-deployment token generated on first use in `.state/router.token` (mode 600; `ROUTER_TOKEN_FILE` or `STRANGLER_STATE_DIR` move it) and resolved by one shared rule in both the proxy and the cutover gate. The governance gate protects the Switch command path; a local process that can read `.state/` could still call `/_router/flip` directly, just as it could read the agents' credentials. |
+| **Creator-only room documents** | Each document has exactly one *agent* writer: Switch answers 403 when an agent other than the creator calls `update_room_document`. Other agents can only read it (the `load_internal_documents` op) and mirror it with a sha256 evidence digest. So nothing authenticated as the fuzzer can rewrite the translator's ledger. The proxy's flip endpoint needs a token that has no public default: `ROUTER_ADMIN_TOKEN` if you set one, otherwise a random per-deployment token generated on first use in `.state/router.token` (mode 600; `ROUTER_TOKEN_FILE` or `STRANGLER_STATE_DIR` move it) and resolved by one shared rule in both the proxy and the cutover gate. The governance gate protects the Switch command path. By default every process runs as the operator, so a local process that can read `.state/` could still call `/_router/flip` directly or read the agents' credentials; `make isolate` runs each component as its own Unix user so that none of them can (§8). |
 | **Hash-chained ledger** | Every trail entry stores `prev` and `hash = sha256(canonical(entry))` (`agents/ledger.py`, `verify_chain`). Sealing writes `sealed = {at, head_hash, entries}`. The driver re-verifies the chain through the Gateway, as admin and independently of the agents. The hashes are unkeyed, so tamper evidence comes from the head hash also being posted in the channel: a later rewrite of the document, for example by a Gateway admin, would no longer match it. |
 | **Addressing-policy unlock** | Bootstrap-registered agents are owned by a non-admin user, so by default Switch refuses messages from the human. `agents/provision.py` clears each agent's policy as Gateway admin (`PUT /gateway/agents/{id}/addressing-policy {"policy": null}`). |
 | **Human-only governance gate** | `migrate`, `preserve/deprecate`, `approve-cutover` and `rollback` are refused unless the sender is the room's human lead: a participant whose `type`, as Switch reports it, is `user` and whose name is `RoomInfo.human` (`RoomAgent.classify`; other people who join the bridged channel are `guest`s, and names that collide after case folding are refused). Nothing in the message text can change that. Build changes and routing changes are mutually exclusive: the translator holds a cross-process production lock (`agents/locks.py`, an `flock`) for a whole `migrate`/decision and the cutover gate for a whole `approve-cutover`/`rollback`, so production can never be flipped onto a build that is being replaced. Stale or replayed commands are refused too: an approval older than the latest benchmark or router flip, a rollback older than the latest flip, and a migrate/decision message older than the current migration's request never act. The demo proves this live: it posts `@cutover-gate approve-cutover` *as the fuzzer agent* (`POST /agents/{id}/message`) and asserts `🛑 Governance gate` with the proxy still on legacy. |
@@ -270,7 +270,8 @@ make demo      # switch-up → targets.sh start --fresh → provision → agents
 | `make cinema` | `.venv/bin/python scripts/run_e2e_demo.py --cinema --fresh` |
 | `make test` / `test-integration` | `pytest -m 'not integration'` / `pytest -m integration` |
 | `make stop` | stop agents, targets and Switch (native mode stops only the servers `switch-up` started and recorded in `.native/*.pid`; it leaves Postgres up rather than pull it from under an untracked server) |
-| `make clean-state` | stop agents and targets, then wipe `.state/` except `switch.env` (agent credentials included, so the next `make provision` re-registers them) |
+| `make clean-state` | stop agents and targets, then wipe `.state/` except `switch.env` and `connection.env` (agent credentials included, so the next `make provision` re-registers them), and empty `/srv/stranglerroom/state` if the service area exists |
+| `make isolate` / `isolate-verify` / `isolate-off` | run every component as its own Unix user from `/srv/stranglerroom` / prove it / turn it off (§8) |
 
 ### Recording mode (`make cinema`)
 
@@ -283,7 +284,7 @@ and gives you a 10 s countdown. The whole run takes about 83 s.
 2. Run `make cinema`. Because of `--fresh`, it archives the old room and creates a new channel, then prints
    `http://localhost:18065/switch/channels/<slug>`. Open that URL during the countdown.
 3. Log in to Mattermost as **`user`** with `MATTERMOST_USER_PASSWORD` from `.state/switch.env`.
-4. Optional: open the Switch Gateway UI at `http://localhost:18000` (docker mode: `http://localhost:3000`) and sign in as `GATEWAY_ADMIN_EMAIL` /
+4. Optional: open the Switch Gateway UI at `http://127.0.0.1:18000` (docker mode: `http://localhost:3000`) and sign in as `GATEWAY_ADMIN_EMAIL` /
    `GATEWAY_ADMIN_PASSWORD` from `.state/switch.env` to watch the room and its three documents.
 
 To print the current channel's browser URL:
@@ -312,8 +313,8 @@ Then post in the new channel as `user`, one command at a time, each after the ag
 @translator status                # any time; also @fuzzer status / @cutover-gate status, and help
 ```
 
-Watch the routing with `curl -s localhost:9000/_router/status` or
-`curl -si localhost:9000/people/george08/lists.json | grep -i x-strangler-upstream`.
+Watch the routing with `curl -s 127.0.0.1:9000/_router/status` or
+`curl -si 127.0.0.1:9000/people/george08/lists.json | grep -i x-strangler-upstream`.
 
 ## 8. Native vs Docker
 
@@ -323,17 +324,74 @@ otherwise. Force a mode with `SWITCH_MODE=docker|native`.
 | | Native (this dev box: an unprivileged k8s pod, no Docker) | Docker (CI) |
 |---|---|---|
 | How | Builds Switch 0.31.0 from the `switch-v0.31.0` tag into `.switch-infra/`, plus Postgres 16, the Mattermost 11.9.0 tarball, and switch-core via `uv` serving the built Gateway UI | Upstream `deploy/local/standalone-docker-compose.yml --profile collab --profile gateway` |
-| Switch API | `http://localhost:18000` | `http://localhost:8000` |
+| Switch API (`SWITCH_URL`) | `http://127.0.0.1:18000` | `http://127.0.0.1:8000` |
 | Gateway UI (Switch Console) | `http://localhost:18000` (served by switch-core) | `http://localhost:3000` (`gateway` container) |
 | Mattermost | `http://localhost:18065` | `http://localhost:18065` |
 
-Both modes run the upstream seeder and write `.state/switch.env` (URLs and credentials). Agents and the driver read
-it through `Settings.load()`, and environment variables override it.
+Both modes run the upstream seeder and write `.state/switch.env` (URLs and credentials, mode 0600) and its public part
+`.state/connection.env` (URLs only, 0644). Provisioning and the driver read `switch.env` through `Settings.load()`. An
+agent reads only `SWITCH_URL`, from the environment or `connection.env` (`Settings.load_agent()`): it never opens
+`switch.env`, so it never holds the registration token, the admin password or the human's password. Environment
+variables override the files.
 
 CI (`.github/workflows/e2e.yml`) has two jobs. `unit` runs `make install` and `make test`. `e2e` runs
 `SWITCH_MODE=docker bash scripts/bootstrap_switch.sh`, `make install` and `make e2e`. It then creates switch-core's venv
 (`uv sync --frozen --no-dev --project .switch-infra/core`) and runs `validate_template.py --run`. On failure or
 cancellation it uploads `.state/run/*.log` and the compose logs.
+
+### Per-component OS users (`make isolate`)
+
+By default every StranglerRoom process runs as the operator, so a component — or code it runs, like the
+translator-generated module inside the modern server — could read every secret in `.state/`: the other agents' API keys,
+the router token, and `switch.env`, which holds the human lead's Mattermost password. `make isolate` (root, once) turns
+on isolation for this checkout ([docs/ISOLATION.md](docs/ISOLATION.md)):
+
+* six system users (`sr-translator`, `sr-fuzzer`, `sr-cutover-gate`, `sr-proxy`, `sr-legacy`, `sr-modern`) and a group
+  `sr-prodlock` shared by the translator and the gate for the production lock;
+* a root-owned service area `/srv/stranglerroom`: a mirror of the code and the virtualenv, plus a state directory in which
+  each component owns only its private directory, and each agent gets a copy of its own API key (0600, owned by it) and
+  of `room.json`. The router token reaches only the proxy and the gate, through their environment;
+* `/root`, the checkout and its `.state/` keep their permissions (0700), so no service user can reach `switch.env`, the
+  router token, the master copies of the keys or the logs.
+
+From then on `scripts/agents.sh` and `scripts/targets.sh` (and therefore `make demo`) launch each process through
+`python -m agents.isolation exec`. It refreshes the mirrors, gives the component a new session, closes every inherited
+descriptor, drops to the component's user and `exec`s it, with an environment built from that component's own
+allow-list. `make isolate-verify` proves it: as each service user it attempts every access in the matrix of
+docs/ISOLATION.md §6 (the kernel decides), imports the component's module, scans every file that user can reach for
+every secret value, and checks the live processes' uids, sessions and environments. `make isolate-off` turns it off
+(`--purge` also removes the users and `/srv/stranglerroom`). CI runs as a non-root user without the marker, so
+isolation stays off there.
+
+On the dev box (Switch 0.31.0 native), after `make isolate`, the live e2e ran with all six components as their own users:
+`run_e2e_demo.py --fresh` passed 35/35. `make isolate-verify` with the stack running: 320 checks, 318 PASS and 0 FAIL. The 2
+SKIPs are LLM mode being off and Mattermost's built-in placeholder database password, which is too short to search for.
+The 318 cover 195 access probes, 30 refused cross-component signals, the six smoke imports, and the secret scan of about
+3,100 readable files per user. The live negative checks also held:
+* `setup` and `disable` refuse while components run;
+* agents started unisolated are refused by `agents.sh start` and fail `isolate-verify`;
+* a `nobody`-owned `[::1]:18000` listener fails `isolate-verify`;
+* a foreign server on `:9001` is refused by `targets.sh start`.
+
+Turning isolation on or off switches each component to the other layout's state (the service area's or the checkout's
+`.state/`). Routing, the divergence registry and the generated module do not carry over, so start fresh afterwards
+(`make demo`, or `scripts/targets.sh start --fresh`). `setup` and `disable` say so.
+
+What it does not do: a component keeps its own authority. A compromised translator can still publish any module, a
+compromised gate can still flip the proxy, and a compromised proxy can route anywhere. Switch, Mattermost and Postgres
+are unchanged, and they authenticate their clients.
+
+Two host-level rules come with it, because service users can open sockets:
+
+* **IP literals for servers that listen on one address family.** Switch and the targets listen on `127.0.0.1` only. A
+  service user could bind the same port on `::1`, which `localhost` resolves to first on many hosts, and receive whatever
+  a client sends there: API keys, or the admin password. So `SWITCH_URL` is `http://127.0.0.1:18000`, the launcher
+  refuses a `localhost` Switch/target URL, and `isolate-verify` checks who owns every listener on those ports, in both
+  address families. Mattermost listens on all addresses (`[::]`), so `localhost:18065` cannot be squatted.
+* **Cookies are host-scoped, not port-scoped.** Keep Mattermost at `localhost:18065` in the browser. Use the proxy
+  (`127.0.0.1:9000`), not the targets' own ports, in a browser that holds a Mattermost or Gateway session. The proxy
+  drops those session cookies before forwarding; a direct request to `:9001` or `:9002` would hand them to code that
+  the translator generated.
 
 ## 9. Switch Console template
 
@@ -432,12 +490,13 @@ Every review round, each finding's disposition (fixed with a regression test, or
 
 | Symptom | Fix |
 |---|---|
-| `make e2e` prints `PRE-FLIGHT FAILED: …` and exits 2 | Read the reason after the colon (Switch health, target ports, agents not `live`, proxy not on legacy, Mattermost login). If Switch is down, run `make switch-up` and confirm that `curl -s localhost:18000/health` (docker: `:8000`) returns `{"status":"ok"}` |
+| `make e2e` prints `PRE-FLIGHT FAILED: …` and exits 2 | Read the reason after the colon (Switch health, target ports, agents not `live`, proxy not on legacy, Mattermost login). If Switch is down, run `make switch-up` and confirm that `curl -s 127.0.0.1:18000/health` (docker: `:8000`) returns `{"status":"ok"}` |
 | `targets.sh start --fresh` fails with a busy-port error | Something this repo doesn't track holds 9000, 9001 or 9002. Find its owner with `ss -ltnp \| grep ':900'` or `lsof -i :9000`, then stop it; `--fresh` deliberately never reuses an untracked server |
-| An agent is not `live` / no replies | `bash scripts/agents.sh status`, then read `.state/run/<agent>.log`; `bash scripts/agents.sh restart` |
+| An agent is not `live` / no replies | `bash scripts/agents.sh status`, then read `.state/run/<agent>.log`; `bash scripts/agents.sh restart` (with isolation on, run it as root: the restart re-copies the room and key into the service area and relaunches the agent as its user) |
+| Isolation: `agents.sh`/`targets.sh` say a component runs "not as sr-<name>", or `isolate-verify` fails | Something runs unisolated or untracked: `bash scripts/agents.sh restart` / `bash scripts/targets.sh stop && bash scripts/targets.sh start`, then `make isolate-verify`. The failing rows name the process, uid or file |
 | "You're not permitted to direct messages to me in this room." | The addressing policies were not cleared: run `make provision` (it uses the Gateway admin from `.state/switch.env`) |
 | Old channel or the wrong room | `--fresh` archives the old room and creates a new channel with a new slug. Use the URL that `make cinema` prints, or the `channel_url` in `.state/room.json` |
-| Proxy left on modern after a run | Post `@cutover-gate rollback` as `user`, or check with `curl -s localhost:9000/_router/status` |
+| Proxy left on modern after a run | Post `@cutover-gate rollback` as `user`, or check with `curl -s 127.0.0.1:9000/_router/status` |
 | `⚠️ LLM synthesis rejected …` | Only in `STRANGLER_TRANSLATOR_MODE=llm`: the generated module failed validation, and the translator fell back to deterministic codegen and said so (tolerated by the driver) |
 | Step timeout on a slow box | `.venv/bin/python scripts/run_e2e_demo.py --fresh --step-timeout 480` (default 240 s; the slowest step, the benchmark, takes about 9 s) |
-| Want a clean slate | `make clean-state` (keeps `.state/switch.env`), then `make demo` |
+| Want a clean slate | `make clean-state` (keeps `.state/switch.env` and `connection.env`), then `make demo` |

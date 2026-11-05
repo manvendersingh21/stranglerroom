@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# Per-component OS-user isolation needs root and `make isolate` (docs/ISOLATION.md); the runner is neither, so say
+# it explicitly instead of relying on the absent marker.
+env:
+  STRANGLER_ISOLATION: 'off'
+
 concurrency:
   group: '${{ github.workflow }}-${{ github.ref }}'
   cancel-in-progress: true

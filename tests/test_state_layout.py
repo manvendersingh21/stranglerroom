@@ -355,3 +355,23 @@ def test_room_json_is_published_0644_atomically_under_any_umask(tmp_path, monkey
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
     assert pv.RoomInfo.load().room_id == "room-1"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["room.json"]
+
+
+def test_provision_warns_that_isolated_agents_need_a_restart(monkeypatch, caplog):
+    """agy operator re-audit 1.3: provisioning writes the checkout's room.json and keys; isolated agents read their
+    service-area copies, refreshed only when they are (re)started."""
+    import agents.isolation as iso
+    import agents.provision as pv
+
+    for value, expected in ((True, True), (False, False)):
+        monkeypatch.setattr(iso, "isolation_on", lambda env=None, value=value: value)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="strangler.provision"):
+            pv._isolation_note()
+        assert ("agents.sh restart" in caplog.text) is expected
+
+    def broken(env=None):
+        raise iso.IsolationError("misconfigured")
+
+    monkeypatch.setattr(iso, "isolation_on", broken)   # advisory only: never fails provisioning
+    pv._isolation_note()
