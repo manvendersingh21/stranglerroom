@@ -43,7 +43,7 @@ from typing import Any, Iterator, NoReturn
 LOCK_GROUP = "sr-prodlock"
 DEFAULT_SERVICE_HOME = Path("/srv/stranglerroom")
 DEFAULT_MARKER = Path("/etc/stranglerroom/isolation.json")
-DEFAULT_SWITCH_URL = "http://localhost:18000"
+DEFAULT_SWITCH_URL = "http://127.0.0.1:18000"
 NOLOGIN_SHELLS = ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false")
 NO_HOME = "/nonexistent"
 MARKER_VERSION = 2
@@ -233,34 +233,71 @@ def run_dir_for(component: Component | str, env: Mapping[str, str] | None = None
 
 # --------------------------------------------------------------------------------------------- trusted paths
 
-def _chain(path: Path) -> list[Path]:
+def _check_dir(st: os.stat_result, part: Path, path: Path, *, last: bool, owners: tuple[int, ...],
+               traversable: bool) -> None:
+    if not stat.S_ISDIR(st.st_mode):
+        raise IsolationError(f"{part} is a symlink or not a directory (on the path to {path})")
+    if st.st_uid not in owners:
+        raise IsolationError(f"{part} is owned by uid {st.st_uid}, not root (on the path to {path})")
+    if st.st_mode & 0o022 and not (st.st_mode & stat.S_ISVTX and not last):
+        raise IsolationError(f"{part} is group/other-writable (mode {stat.S_IMODE(st.st_mode):04o}; on the path "
+                             f"to {path})")
+    if traversable and not st.st_mode & 0o001:
+        raise IsolationError(f"{part} is not searchable by others (mode {stat.S_IMODE(st.st_mode):04o}), so the "
+                             f"service users cannot reach {path}")
+
+
+def open_trusted_dir(path: Path, *, create_mode: int | None = None, owners: tuple[int, ...] = (0,),
+                     traversable: bool = False) -> int | None:
+    """Open ``path`` one component at a time from /, each with O_DIRECTORY|O_NOFOLLOW relative to its parent's
+    descriptor, and fstat-check each before descending: a real directory owned by root (``owners``) and not writable
+    by group or others, except a sticky directory such as /tmp that is not the last component (its next component
+    must then be root's too, so nobody else can rename it away). No part of the path can be swapped by a service.
+    ``traversable``: others may also search every component. A missing component is created (``create_mode``,
+    relative to the checked parent) or, without ``create_mode``, makes this return None. Returns the descriptor."""
     path = Path(os.path.normpath(path))
-    return [*reversed(path.parents), path]
+    if not path.is_absolute():
+        raise IsolationError(f"{path} is not an absolute path")
+    fd = os.open("/", _DIR_FLAGS)
+    try:
+        parts = path.parts[1:]
+        _check_dir(os.fstat(fd), Path("/"), path, last=not parts, owners=owners, traversable=traversable)
+        current = Path("/")
+        for i, name in enumerate(parts):
+            current = current / name
+            try:
+                child = os.open(name, _DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if create_mode is None:
+                    os.close(fd)
+                    return None
+                try:
+                    os.mkdir(name, create_mode, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = _openat_dir(fd, name, current)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise IsolationError(f"{current} is a symlink or not a directory (on the path to {path})") from exc
+                raise
+            os.close(fd)
+            fd = child
+            _check_dir(os.fstat(fd), current, path, last=i == len(parts) - 1, owners=owners,
+                       traversable=traversable)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def check_trusted_path(path: Path, *, traversable: bool = False, allow_missing: bool = False) -> None:
-    """Every component from / down to ``path`` is a real directory owned by root and not writable by group or
-    others, except a sticky directory (like /tmp), whose next component is then itself root-owned, so it cannot be
-    renamed away. Hence no service can swap any part of the path. ``traversable``: others may also search every
-    component (the services must reach it). ``allow_missing``: a missing tail is fine (it will be created)."""
-    chain = _chain(path)
-    for i, part in enumerate(chain):
-        try:
-            st = os.lstat(part)
-        except FileNotFoundError:
-            if allow_missing:
-                return
-            raise IsolationError(f"{part} does not exist") from None
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            raise IsolationError(f"{part} is a symlink or not a directory (on the path to {path})")
-        if st.st_uid != 0:
-            raise IsolationError(f"{part} is owned by uid {st.st_uid}, not root (on the path to {path})")
-        if st.st_mode & 0o022 and not (st.st_mode & stat.S_ISVTX and i + 1 < len(chain)):
-            raise IsolationError(f"{part} is group/other-writable (mode {stat.S_IMODE(st.st_mode):04o}; on the path "
-                                 f"to {path})")
-        if traversable and not st.st_mode & 0o001:
-            raise IsolationError(f"{part} is not searchable by others (mode {stat.S_IMODE(st.st_mode):04o}), so the "
-                                 f"service users cannot reach {path}")
+    """``open_trusted_dir`` without keeping the descriptor. ``allow_missing``: a missing tail is fine."""
+    fd = open_trusted_dir(path, traversable=traversable)
+    if fd is None:
+        if allow_missing:
+            return
+        raise IsolationError(f"{path} does not exist")
+    os.close(fd)
 
 
 _RUN_DIR_ENTRY = re.compile(r"^(?:[A-Za-z0-9_-]+\.(?:pid|log)|\.lock|\.targets\.lock)$")
@@ -271,14 +308,11 @@ def ensure_run_dir(path: Path) -> list[str]:
     existing directory is tightened to 0700 only if it holds nothing but launcher files (pid files, logs, locks), so
     a mistaken ``STRANGLER_RUN_DIR=/var/log`` is refused instead of locked down."""
     path = Path(os.path.normpath(path))
-    check_trusted_path(path, allow_missing=True)
     actions = []
-    for part in _chain(path):
-        if not os.path.lexists(part):
-            os.mkdir(part, 0o700)
-            actions.append(f"mkdir {part}")
-    check_trusted_path(path)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    if not os.path.lexists(path):
+        actions.append(f"mkdir {path} (and any missing parent, 0700)")
+    fd = open_trusted_dir(path, create_mode=0o700)  # created and checked descriptor by descriptor
+    assert fd is not None
     try:
         st = os.fstat(fd)
         if stat.S_IMODE(st.st_mode) != 0o700:
@@ -319,20 +353,27 @@ def _read_small(fd: int, limit: int = 1 << 20) -> bytes:
 
 def load_marker(env: Mapping[str, str] | None = None) -> dict[str, Any] | None:
     """The marker written by ``setup``, or None if there is none. A marker that exists but is not a trusted,
-    well-formed JSON object raises: it may be ours, so it is never silently ignored."""
+    well-formed JSON object raises: it may be ours, so it is never silently ignored. The marker's directory chain
+    is checked component by component first (``open_trusted_dir``; root or the caller itself may own each part):
+    an ancestor a service could rename is an error even when the marker is missing, so "no marker" (off) can never
+    be produced by a service moving the marker's directory away."""
     path = marker_path(env)
+    dfd = open_trusted_dir(path.parent, owners=(0, os.geteuid()))
+    if dfd is None:
+        return None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=dfd)
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise IsolationError(f"cannot open the isolation marker {path} (symlinks are refused): {exc}") from exc
+    finally:
+        os.close(dfd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise IsolationError(f"isolation marker {path} is not a regular file")
         _require_trusted(st, f"isolation marker {path}")
-        _require_trusted(os.stat(path.parent), f"marker directory {path.parent}")
         data = _read_small(fd)
     finally:
         os.close(fd)
@@ -386,9 +427,15 @@ def _ready_paths(values: Mapping[str, str]) -> ServicePaths:
 
 # ------------------------------------------------------------------------------------------- environment (§4.4)
 
-_COMMON_KEYS = frozenset({"PATH", "LANG", "LANGUAGE", "TZ", "PYTHONUNBUFFERED", "STRANGLER_LOG_LEVEL"})
-_LAUNCHER_SET = frozenset({"STRANGLER_STATE_DIR", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "HOME", "USER",
-                           "LOGNAME", "MODERN_LISTS_PATH", "ROUTER_ADMIN_TOKEN", "SWITCH_URL"})
+_LOCALE_KEYS = ("LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY", "LC_MESSAGES",
+                "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION")
+_COMMON_KEYS = frozenset({"PATH", "LANG", "LANGUAGE", "TZ", "PYTHONUNBUFFERED", "STRANGLER_LOG_LEVEL",
+                          *_LOCALE_KEYS})
+_LAUNCHER_SET = frozenset({"STRANGLER_STATE_DIR", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTHONSAFEPATH", "HOME",
+                           "USER", "LOGNAME", "MODERN_LISTS_PATH", "ROUTER_ADMIN_TOKEN", "SWITCH_URL"})
+#: URLs a component dials: a host name such as localhost may resolve to ::1 first, where any service user can listen
+#: if the real server binds 127.0.0.1 only (and collect bearer keys). Only IP literals are accepted.
+_URL_KEYS = ("SWITCH_URL", "PROXY_URL", "LEGACY_URL", "MODERN_URL")
 #: never forwarded by STRANGLER_TRANSLATOR_PASS_ENV: the router token and the operator's switch.env / Switch .env
 #: secrets (pass-through is for LLM credentials), loader and interpreter knobs
 _FORBIDDEN = frozenset({
@@ -419,7 +466,7 @@ def child_env(component: Component | str, parent_env: Mapping[str, str], *, path
     comp = _component(component)
     env: dict[str, str] = {}
     for key, value in parent_env.items():
-        if key in _COMMON_KEYS or key.startswith("LC_") or key in comp.env_keys:
+        if key in _COMMON_KEYS or key in comp.env_keys:
             env[key] = value
     if comp.name == "translator":
         for name in _pass_names(parent_env):
@@ -428,6 +475,7 @@ def child_env(component: Component | str, parent_env: Mapping[str, str], *, path
     env["STRANGLER_STATE_DIR"] = str(paths.state)
     env["PYTHONPATH"] = str(paths.app)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONSAFEPATH"] = "1"  # no implicit cwd / script directory on sys.path: only app/ (PYTHONPATH)
     env["HOME"] = str(paths.private(comp))
     env["USER"] = env["LOGNAME"] = comp.user
     if comp.uses_module:
@@ -445,7 +493,25 @@ def child_env(component: Component | str, parent_env: Mapping[str, str], *, path
     else:
         env.pop("ROUTER_ADMIN_TOKEN", None)
     env.pop("ROUTER_TOKEN_FILE", None)
+    for key in _URL_KEYS:
+        if key in env:
+            check_ip_url(key, env[key])
     return env
+
+
+def check_ip_url(key: str, url: str) -> None:
+    """``url`` must name its host as an IP literal (loopback or remote), never a name such as ``localhost``: a name
+    can resolve to an address (e.g. ::1) where the real server does not listen but any service user may."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(url.strip()).hostname or ""
+        ipaddress.ip_address(host)
+    except ValueError:
+        raise IsolationError(f"{key}={url!r}: use an IP literal host (e.g. http://127.0.0.1:18000), not a name: "
+                             "localhost may resolve to ::1, where any service user could listen and collect "
+                             "credentials") from None
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -502,6 +568,7 @@ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 _NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _PR_SET_NO_NEW_PRIVS = 38
+_PR_SET_DUMPABLE = 4
 
 
 def _libc() -> ctypes.CDLL:
@@ -749,24 +816,120 @@ def _check_mirrored_link(top: Path, src_path: Path, target: str) -> None:
     tree (it is copied verbatim, so it resolves to the mirrored copy), an absolute one must lead to a path that only
     root can modify (e.g. bin/python -> /usr/bin/python3.12)."""
     if not os.path.isabs(target):
-        # the directory it names must lie inside the tree; its last component, if itself a link, is checked when
-        # that link is mirrored
-        lexical = os.path.normpath(os.path.join(os.path.dirname(src_path), target))
-        parent, inside = os.path.realpath(os.path.dirname(lexical)), os.path.realpath(top)
-        if os.path.basename(lexical) not in ("", "..") and (parent == inside or parent.startswith(inside + os.sep)):
-            return
-        raise IsolationError(f"{src_path} -> {target} leaves {top}: refusing to mirror it")
-    resolved = Path(os.path.realpath(target))
+        _check_relative_link(top, src_path, target)
+        return
     try:
-        check_trusted_path(resolved.parent)
-        st = os.lstat(resolved)
-    except FileNotFoundError:
-        return  # dangling, in a directory only root can write
+        check_link_target(target, Path("/"))
     except IsolationError as exc:
         raise IsolationError(f"{src_path} -> {target}: {exc}; refusing to mirror it") from exc
-    if st.st_uid != 0 or st.st_mode & 0o022:
-        raise IsolationError(f"{src_path} -> {target}: {resolved} is not root's alone (uid {st.st_uid}, mode "
-                             f"{stat.S_IMODE(st.st_mode):04o}); refusing to mirror it")
+
+
+MAX_LINK_DEPTH = 40
+
+
+def _check_relative_link(top: Path, src_path: Path, target: str) -> None:
+    """A relative link is copied verbatim, so it must resolve inside its tree: resolved step by step (following
+    the links it meets, not lexically), it may never climb above ``top``. Once it meets an absolute link, the rest
+    of the resolution is outside the mirror and must pass ``check_link_target``."""
+    inside = Path(os.path.realpath(top))
+    hops = [0]
+
+    def refuse(why: str) -> IsolationError:
+        return IsolationError(f"{src_path} -> {target}: {why}; refusing to mirror it")
+
+    def resolve(text: str, current: Path) -> Path | None:
+        parts = [p for p in text.split("/") if p not in ("", ".")]
+        for i, name in enumerate(parts):
+            last = i == len(parts) - 1
+            if name == "..":
+                if current == inside:
+                    raise refuse(f"it leaves {top}")
+                current = current.parent
+                continue
+            path = current / name
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                return None  # dangling inside the tree: the mirrored copy dangles the same way
+            if stat.S_ISLNK(st.st_mode):
+                hops[0] += 1
+                if hops[0] > MAX_LINK_DEPTH:
+                    raise refuse(f"more than {MAX_LINK_DEPTH} symlinks")
+                inner = os.readlink(path)
+                if os.path.isabs(inner):
+                    try:
+                        check_link_target("/".join([inner.rstrip("/"), *parts[i + 1:]]), Path("/"))
+                    except IsolationError as exc:
+                        raise refuse(str(exc)) from exc
+                    return None
+                nxt = resolve(inner, current)
+                if nxt is None:
+                    return None
+                current = nxt
+            elif stat.S_ISDIR(st.st_mode):
+                current = path
+            elif last:
+                return path
+            else:
+                raise refuse(f"{path} is not a directory")
+        return current
+
+    start = Path(os.path.realpath(src_path.parent))
+    if start != inside and inside not in start.parents:
+        raise refuse(f"it is not inside {top}")
+    resolve(target, start)
+
+
+def check_link_target(target: str, base: Path) -> Path:
+    """Resolve a symlink's ``target`` (relative ones from ``base``, the directory holding the link) as the kernel
+    would, and require that only root can change any step of that resolution: every directory traversed is root's
+    and not writable by others (a sticky one only as a pass-through to a root-owned entry), every symlink followed is
+    root's and is itself resolved the same way (up to MAX_LINK_DEPTH links), the final file, if present, is root's
+    and not writable by others, and a missing component is accepted only in a directory nobody else can write.
+    Mutable indirection is refused even if it currently points somewhere trustworthy. Returns the resolved path."""
+    check_trusted_path(base)
+    hops = [0]
+
+    def trusted(st: os.stat_result, path: Path, *, last: bool) -> None:
+        if st.st_uid != 0:
+            raise IsolationError(f"{path} is owned by uid {st.st_uid}, not root")
+        if not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022 and not (
+                stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX and not last):
+            raise IsolationError(f"{path} is group/other-writable (mode {stat.S_IMODE(st.st_mode):04o})")
+
+    def resolve(text: str, current: Path) -> Path:
+        if text.startswith("/"):
+            current = Path("/")
+        parts = [p for p in text.split("/") if p not in ("", ".")]
+        for i, name in enumerate(parts):
+            last = i == len(parts) - 1
+            if name == "..":
+                current = current.parent  # an ancestor of a checked directory: checked on the way down
+                continue
+            path = current / name
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                if os.lstat(current).st_mode & 0o022:
+                    raise IsolationError(f"{path} is missing in {current}, which others can write") from None
+                return path  # dangling: only root could create it
+            trusted(st, path, last=last)
+            if stat.S_ISLNK(st.st_mode):
+                hops[0] += 1
+                if hops[0] > MAX_LINK_DEPTH:
+                    raise IsolationError(f"more than {MAX_LINK_DEPTH} symlinks resolving {target}")
+                current = resolve(os.readlink(path), current)
+                if not last and not os.path.isdir(current):
+                    raise IsolationError(f"{path} does not lead to a directory")
+            elif stat.S_ISDIR(st.st_mode):
+                current = path
+            elif last:
+                return path
+            else:
+                raise IsolationError(f"{path} is not a directory")
+        return current
+
+    return resolve(target, Path(os.path.normpath(base)))
 
 
 def _mirror_dir(src: Path, dst_fd: int, label: Path, rel: str, actions: list[str], *, app: bool,
@@ -962,12 +1125,24 @@ def reset(paths: ServicePaths, *, owners: Mapping[str, int] | None = None) -> li
                         raise IsolationError(f"{paths.state / dirname} is owned by uid {owner}, expected "
                                              f"{owners[dirname]}: refusing to reset it")
                     for name in names:
-                        _unlink_at(dfd, name, paths.state / dirname / name, actions)
+                        try:
+                            _unlink_at(dfd, name, paths.state / dirname / name, actions)
+                        except IsolationError as exc:  # e.g. a directory planted under that name: never abort
+                            actions.append(f"WARNING: {exc}; left in place")
                 finally:
                     os.close(dfd)
         finally:
             os.close(state_fd)
     return actions
+
+
+def clean_target(env: Mapping[str, str] | None = None) -> ServicePaths | None:
+    """The service area ``clean`` empties, whatever the mode: the marker's (for this checkout) or the default one, if
+    its state directory exists."""
+    marker = load_marker(env)
+    home = marker["service_home"] if marker and _same_repo(marker["repo"]) else DEFAULT_SERVICE_HOME
+    paths = service_paths(home)
+    return paths if os.path.lexists(paths.state) else None
 
 
 def clean(paths: ServicePaths) -> list[str]:
@@ -1007,10 +1182,14 @@ def _cap_sets() -> dict[str, int]:
 
 def drop_privileges(uid: int, gid: int, groups: list[int]) -> None:
     """Become ``uid``/``gid`` with exactly ``groups`` as supplementary groups (replacing root's), for real,
-    effective and saved ids; prove that root cannot be regained; set no_new_privs and umask 077."""
+    effective and saved ids; prove that root cannot be regained; set no_new_privs, join a fresh session keyring and
+    set umask 077. The process is made non-dumpable first, so the target uid can never ptrace it or read its
+    memory while it still holds root's data (execve of the component resets this)."""
     groups = list(groups)
     if uid == 0 or gid == 0 or 0 in groups:
         raise IsolationError("refusing to 'drop' privileges to root")
+    if _prctl(_PR_SET_DUMPABLE, 0) != 0:
+        raise IsolationError("cannot make the process non-dumpable")
     os.setgroups(groups)
     os.setresgid(gid, gid, gid)
     os.setresuid(uid, uid, uid)
@@ -1027,9 +1206,35 @@ def drop_privileges(uid: int, gid: int, groups: list[int]) -> None:
     caps = _cap_sets()
     if any(caps.get(k, 0) for k in ("CapPrm", "CapEff", "CapAmb")):
         raise IsolationError(f"capabilities survived the privilege drop: {caps}")
-    if _libc().prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-        raise IsolationError("cannot set no_new_privs")
+    # the credential change reset "dumpable" to fs.suid_dumpable (2 on some hosts): make it 0 again
+    if _prctl(_PR_SET_DUMPABLE, 0) != 0 or _prctl(_PR_SET_NO_NEW_PRIVS, 1) != 0:
+        raise IsolationError("cannot set non-dumpable / no_new_privs")
+    _join_session_keyring()
     os.umask(0o077)
+
+
+def _prctl(option: int, arg: int) -> int:
+    return _libc().prctl(option, arg, 0, 0, 0)
+
+
+_KEYCTL_SYSCALL = {"x86_64": 250, "aarch64": 219}
+_KEYCTL_JOIN_SESSION_KEYRING = 1
+
+
+def _join_session_keyring() -> None:
+    """Leave the launcher's (root's) session keyring for a new anonymous one, so no key root holds is reachable.
+    Tolerated where keyrings are unavailable or refused (ENOSYS, EPERM, EKEYREVOKED); any other error is fatal."""
+    import platform
+
+    number = _KEYCTL_SYSCALL.get(platform.machine())
+    if number is None:
+        return
+    libc = _libc()
+    libc.syscall.restype = ctypes.c_long
+    if libc.syscall(ctypes.c_long(number), ctypes.c_long(_KEYCTL_JOIN_SESSION_KEYRING), ctypes.c_void_p(None)) < 0:
+        err = ctypes.get_errno()
+        if err not in (errno.ENOSYS, errno.EPERM, errno.EKEYREVOKED):
+            raise IsolationError(f"cannot join a new session keyring: {os.strerror(err)}")
 
 
 def close_inherited_fds() -> None:
@@ -1248,16 +1453,13 @@ def _refuse_while_running(what: str, running: Callable[[], Mapping[int, str]] | 
 
 
 def write_marker(data: Mapping[str, Any], env: Mapping[str, str] | None = None) -> Path:
-    """Write the marker atomically (exclusive temp file + rename in a root-owned directory), mode 0644."""
+    """Write the marker atomically (exclusive temp file + rename) in a directory whose whole chain is checked (and
+    created if missing) descriptor by descriptor; mode 0644."""
     path = marker_path(env)
-    if not os.path.lexists(path.parent):
-        os.mkdir(path.parent, 0o755)
-    dfd = _openat_dir(None, path.parent, path.parent)
+    dfd = open_trusted_dir(path.parent, create_mode=0o755, owners=(0, os.geteuid()))
+    assert dfd is not None
     tmp = f".{path.name}.{os.urandom(6).hex()}.tmp"
     try:
-        st = os.fstat(dfd)
-        if st.st_uid not in (0, os.geteuid()) or st.st_mode & 0o022:
-            raise IsolationError(f"marker directory {path.parent} must be owned by root and not group/other-writable")
         fd = os.open(tmp, _NEW_FILE_FLAGS, 0o644, dir_fd=dfd)
         try:
             os.write(fd, (json.dumps(dict(data), indent=2, sort_keys=True) + "\n").encode())
@@ -1279,9 +1481,8 @@ def write_marker(data: Mapping[str, Any], env: Mapping[str, str] | None = None) 
 
 def remove_marker(env: Mapping[str, str] | None = None) -> bool:
     path = marker_path(env)
-    try:
-        dfd = _openat_dir(None, path.parent, path.parent)
-    except FileNotFoundError:
+    dfd = open_trusted_dir(path.parent, owners=(0, os.geteuid()))
+    if dfd is None:
         return False
     try:
         os.unlink(path.name, dir_fd=dfd)
@@ -1329,6 +1530,11 @@ def setup(env: Mapping[str, str] | None = None, *, service_home: Path | str | No
             if not ok:
                 raise IsolationError(f"startup smoke failed for {comp.name} (marker left at setting-up): {output}")
             actions.append(f"{comp.name}: startup smoke import of {comp.module} as {comp.user} passed")
+    llm = llm_cli_check(resolve(COMPONENTS["translator"]), values)
+    if llm.status == "FAIL":
+        raise IsolationError(f"STRANGLER_TRANSLATOR_MODE=llm: {llm.actual} (marker left at setting-up)")
+    if llm.status == "PASS":
+        actions.append(f"translator: LLM CLI {llm.actual} runs as sr-translator")
     marker.update(state="ready", updated=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     actions.append(f"marker {write_marker(marker, values)}: ready")
     return actions
@@ -1349,8 +1555,9 @@ def disable(env: Mapping[str, str] | None = None, *, purge: bool = False,
         actions.append(f"removed {marker_path(values)}")
     else:
         actions.append(f"no marker at {marker_path(values)}")
+    paths = service_paths((marker or {}).get("service_home") or DEFAULT_SERVICE_HOME)
+    actions += remove_key_copies(paths)  # API keys never outlive isolation, purge or not
     if purge:
-        paths = service_paths((marker or {}).get("service_home") or DEFAULT_SERVICE_HOME)
         actions += _purge_home(paths)
         for comp in COMPONENTS.values():
             if _lookup(pwd.getpwnam, comp.user) is not None:
@@ -1362,6 +1569,27 @@ def disable(env: Mapping[str, str] | None = None, *, purge: bool = False,
         if _lookup(grp.getgrnam, LOCK_GROUP) is not None:
             run(["groupdel", LOCK_GROUP])
             actions.append(f"groupdel {LOCK_GROUP}")
+    return actions
+
+
+def remove_key_copies(paths: ServicePaths) -> list[str]:
+    """Unlink the agents' API-key copies from the root-only SERVICE_HOME/state/agents (checked descriptors)."""
+    actions: list[str] = []
+    if not os.path.lexists(paths.agents):
+        return actions
+    with _open_home(paths) as home_fd:
+        state_fd = _openat_dir(home_fd, "state", paths.state)
+        try:
+            agents_fd = _openat_dir(state_fd, "agents", paths.agents)
+            try:
+                if os.fstat(agents_fd).st_uid != 0:
+                    raise IsolationError(f"{paths.agents} is not owned by root")
+                for name in sorted(os.listdir(agents_fd)):
+                    _unlink_at(agents_fd, name, paths.agents / name, actions)
+            finally:
+                os.close(agents_fd)
+        finally:
+            os.close(state_fd)
     return actions
 
 
@@ -1618,79 +1846,160 @@ def smoke(component: Component | str, ids: Ids, paths: ServicePaths, *, timeout:
 
 
 def scan_candidates(roots: Iterable[str | Path], *, max_bytes: int = SCAN_MAX_BYTES) -> list[tuple[str, list[str]]]:
-    """(directory, [regular files <= max_bytes]) for every directory under ``roots``, listed as root with the
-    descriptor-based ``os.fwalk``: a directory a service swaps for a symlink mid-walk can neither steer the walk
-    elsewhere nor be followed. Root only lists names here; it never opens a candidate."""
-    out = []
+    """(directory, [regular files <= max_bytes and symlinks]) for every directory under ``roots``, listed as root
+    by descriptor (not ``os.fwalk``, which opens a symlinked directory before checking it): each subdirectory is
+    opened O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK relative to its parent's descriptor, so a directory a service swaps for
+    a symlink (or a device) mid-walk is neither followed nor opened. Root only lists names here; it never opens a
+    candidate nor resolves a link (only the dropped child does, ``search_readable``)."""
+    out: list[tuple[str, list[str]]] = []
     seen: set[str] = set()
+
+    def walk(fd: int, path: str, depth: int) -> None:
+        if path in seen or depth > 256:
+            return
+        seen.add(path)
+        files, subdirs = [], []
+        try:
+            names = sorted(os.listdir(fd))
+        except OSError:
+            return
+        for name in names:
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                subdirs.append(name)
+            elif (stat.S_ISREG(st.st_mode) and st.st_size <= max_bytes) or stat.S_ISLNK(st.st_mode):
+                files.append(name)
+        out.append((path, files))
+        for name in subdirs:
+            try:
+                child = os.open(name, _DIR_FLAGS | os.O_NONBLOCK, dir_fd=fd)
+            except OSError:
+                continue
+            try:
+                walk(child, os.path.join(path, name), depth + 1)
+            finally:
+                os.close(child)
+
     for root in roots:
         root = os.path.normpath(str(root))
-        if not os.path.isdir(root) or os.path.islink(root):
+        try:
+            fd = os.open(root, _DIR_FLAGS | os.O_NONBLOCK)
+        except OSError:
             continue
-        for dirpath, dirnames, filenames, dirfd in os.fwalk(root, follow_symlinks=False, onerror=lambda _e: None):
-            if dirpath in seen:
-                dirnames[:] = []
-                continue
-            seen.add(dirpath)
-            files = []
-            for name in filenames:
-                try:
-                    st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-                except OSError:
-                    continue
-                if stat.S_ISREG(st.st_mode) and st.st_size <= max_bytes:
-                    files.append(name)
-            out.append((dirpath, files))
+        try:
+            walk(fd, root, 0)
+        finally:
+            os.close(fd)
     return out
 
 
+#: caps for the directories a dropped child reaches only through symlinks (they may lead anywhere, even in loops)
+LINK_WALK_MAX_FILES = 20000
+LINK_WALK_MAX_BYTES = 512 * 1024 * 1024
+
+
 def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Mapping[str, bytes], *,
-                    max_bytes: int = SCAN_MAX_BYTES) -> dict[str, Any]:
-    """As the current (dropped) user: open every candidate it can read (the kernel decides) and search it for every
-    secret value. Each file is first opened ``O_PATH|O_NOFOLLOW`` (no side effects, even on a device node swapped
-    in), checked to be a regular file, and only then reopened for reading through that descriptor. Returns the
-    number of files read and [path, [labels]] for each hit; never a secret value."""
+                    own_key: str | None = None, max_bytes: int = SCAN_MAX_BYTES,
+                    link_max_files: int = LINK_WALK_MAX_FILES,
+                    link_max_bytes: int = LINK_WALK_MAX_BYTES) -> dict[str, Any]:
+    """As the current (dropped) user: read every candidate it can (the kernel decides) and search it for every
+    secret value. Each candidate is opened ``O_PATH`` (following a symlink as this user only; no side effects even
+    on a device node), checked with fstat to be a regular file, and only then reopened for reading through that
+    descriptor. A candidate that leads to a directory (a directory symlink) is walked here, as this user, with a
+    (st_dev, st_ino) visited set and the ``link_max_*`` caps. Returns the number of files read, [path, [labels],
+    is-own-key-copy] for each hit (never a value) and whether a cap cut a walk short."""
     by_value: dict[bytes, list[str]] = {}
     for label, value in secrets.items():
         by_value.setdefault(value, []).append(label)
-    count, hits = 0, []
+    own_id = None
+    if own_key:
+        try:
+            own_st = os.stat(own_key)
+            own_id = (own_st.st_dev, own_st.st_ino)
+        except OSError:
+            pass
+    visited: set[tuple[int, int]] = set()
+    for dirpath, _files in candidates:  # directories the listing covers are not walked again through links
+        try:
+            dst = os.stat(dirpath)
+            visited.add((dst.st_dev, dst.st_ino))
+        except OSError:
+            pass
+    state: dict[str, Any] = {"read": 0, "hits": [], "truncated": False, "link_files": 0, "link_bytes": 0}
+
+    def read_one(path: str, pfd: int, st: os.stat_result, via_link_walk: bool) -> None:
+        if st.st_size > max_bytes:
+            return
+        if via_link_walk:
+            if state["link_files"] >= link_max_files or state["link_bytes"] + st.st_size > link_max_bytes:
+                state["truncated"] = True
+                return
+            state["link_files"] += 1
+            state["link_bytes"] += st.st_size
+        try:
+            fd = os.open(f"/proc/self/fd/{pfd}", os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+        except OSError:
+            return
+        try:
+            data = os.read(fd, max_bytes + 1)[:max_bytes]
+        except OSError:
+            return
+        finally:
+            os.close(fd)
+        state["read"] += 1
+        found = [label for value, labels in by_value.items() if value in data for label in labels]
+        if found:
+            state["hits"].append([path, found, (st.st_dev, st.st_ino) == own_id])
+
+    def visit(path: str, stack: list[tuple[str, tuple[int, int]]] | None) -> None:
+        try:
+            pfd = os.open(path, os.O_PATH | os.O_CLOEXEC)  # follows a symlink, as this user
+        except OSError:
+            return
+        try:
+            st = os.fstat(pfd)
+            if stat.S_ISREG(st.st_mode):
+                read_one(path, pfd, st, stack is not None)
+            elif stat.S_ISDIR(st.st_mode):
+                key = (st.st_dev, st.st_ino)
+                if stack is not None:
+                    stack.append((path, key))
+                else:
+                    walk(path, key)
+        finally:
+            os.close(pfd)
+
+    def walk(top: str, key: tuple[int, int]) -> None:
+        stack = [(top, key)]
+        while stack and not state["truncated"]:
+            dirpath, key = stack.pop()
+            if key in visited:
+                continue
+            visited.add(key)
+            try:
+                names = sorted(os.listdir(dirpath))
+            except OSError:
+                continue
+            for name in names:
+                visit(os.path.join(dirpath, name), stack)
+
     for dirpath, files in candidates:
         if not os.access(dirpath, os.X_OK):
             continue
         for name in files:
-            path = os.path.join(dirpath, name)
-            try:
-                pfd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
-            except OSError:
-                continue
-            try:
-                st = os.fstat(pfd)
-                if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
-                    continue
-                try:
-                    fd = os.open(f"/proc/self/fd/{pfd}", os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
-                except OSError:
-                    continue
-                try:
-                    data = os.read(fd, max_bytes + 1)[:max_bytes]
-                except OSError:
-                    continue
-                finally:
-                    os.close(fd)
-            finally:
-                os.close(pfd)
-            count += 1
-            found = [label for value, labels in by_value.items() if value in data for label in labels]
-            if found:
-                hits.append([path, found])
-    return {"read": count, "hits": hits}
+            visit(os.path.join(dirpath, name), None)
+    return {"read": state["read"], "hits": state["hits"], "truncated": state["truncated"]}
 
 
 def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: Iterable[str | Path], *,
                 own_keys: Mapping[str, str] | None = None) -> list[Row]:
-    """§6.4: as each subject, a forked child reads every candidate it can (the kernel decides) and searches it for
-    every secret value. A hit fails unless it is the subject's own API key in its own key copy (``own_keys``:
-    subject -> path)."""
+    """§6.4: as each subject, a forked child reads every candidate it can (the kernel decides), following symlinks
+    only as that user, and searches it for every secret value. A hit fails unless it is the subject's own API key
+    in its own key copy (``own_keys``: subject -> path; matched by inode, so an alias of the copy is no hit). A
+    symlinked-directory walk cut short by its caps fails: the scan is then incomplete."""
     rows: list[Row] = []
     usable = {k: v.encode() for k, v in secrets.items() if len(v) >= MIN_SECRET_LEN}
     for label in sorted(set(secrets) - set(usable)):
@@ -1698,11 +2007,11 @@ def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: 
                         "SKIP"))
     candidates = scan_candidates(roots)
     for subject, ids in subjects.items():
-        result = run_as(ids, search_readable, candidates, usable, timeout=1800.0)
-        own_path = (own_keys or {}).get(subject)
+        own_key = (own_keys or {}).get(subject)
+        result = run_as(ids, lambda key=own_key: search_readable(candidates, usable, own_key=key), timeout=1800.0)
         bad = []
-        for path, labels in result["hits"]:
-            labels = [lb for lb in labels if not (path == own_path and lb == f"api-key:{subject}")]
+        for path, labels, own in result["hits"]:
+            labels = [lb for lb in labels if not (own and lb == f"api-key:{subject}")]
             if labels:
                 bad.append((path, labels))
         for path, labels in bad:
@@ -1710,6 +2019,9 @@ def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: 
                             "FAIL"))
         rows.append(Row("secrets", subject, f"{result['read']} readable files searched for {len(usable)} secret "
                         "values", "0 hits", f"{len(bad)} hits", "PASS" if not bad else "FAIL"))
+        if result["truncated"]:
+            rows.append(Row("secrets", subject, f"symlinked directories walked within {LINK_WALK_MAX_FILES} files / "
+                            f"{LINK_WALK_MAX_BYTES >> 20} MiB", "complete", "cut short", "FAIL"))
     return rows
 
 
@@ -1788,16 +2100,44 @@ def live_pid(component: Component | str, env: Mapping[str, str] | None = None) -
     return pid
 
 
-def process_checks(subjects: Mapping[str, Ids], secrets: Mapping[str, str], pids: Mapping[str, int]) -> list[Row]:
-    """§6.5: live components run as their users with their groups, each in its own session, with the exec
-    finished; ROUTER_ADMIN_TOKEN only in the proxy's and the gate's environment; no secret value in any service
-    process's environment (but the token there) or in any process's command line."""
+def component_instances() -> dict[str, list[int]]:
+    """component -> pids of every process on the host whose argv holds ``-m <its module>``, independent of pid
+    files (an untracked or root-run instance is found too)."""
+    found: dict[str, list[int]] = {}
+    for entry in sorted((e for e in os.listdir("/proc") if e.isdigit()), key=int):
+        if int(entry) == os.getpid():
+            continue
+        pairs = _module_pairs(_proc_bytes(int(entry), "cmdline") or b"")
+        for comp in COMPONENTS.values():
+            if comp.module in pairs:
+                found.setdefault(comp.name, []).append(int(entry))
+    return found
+
+
+def process_checks(subjects: Mapping[str, Ids], secrets: Mapping[str, str], pids: Mapping[str, int], *,
+                   instances: Mapping[str, Sequence[int]] | None = None) -> list[Row]:
+    """§6.5: every process running a component module (``instances``, default: the whole host) must be that
+    component's single tracked pid (``pids``, from the pid files), run as its user with its groups, lead its own
+    session and have finished the isolated exec. SKIP only when no instance runs. ROUTER_ADMIN_TOKEN only in the
+    proxy's and the gate's environment; no secret value in any service process's environment (but the token
+    there) or in any process's command line."""
     rows: list[Row] = []
     uid_owner = {ids.uid: name for name, ids in subjects.items()}
+    instances = component_instances() if instances is None else instances
+    checked: list[tuple[str, int]] = []
     for name in subjects:
-        if name not in pids:
+        found = sorted(instances.get(name, []))
+        if not found:
             rows.append(Row("process", name, "running", "yes", "no", "SKIP"))
-    for name, pid in pids.items():
+            continue
+        if len(found) > 1:
+            rows.append(Row("process", name, f"exactly one instance of {COMPONENTS[name].module}", "1",
+                            f"{len(found)}: pids {found}", "FAIL"))
+        for pid in found:
+            rows.append(_row("process", name, f"pid {pid} is the tracked instance (pid file: {pids.get(name)})", True,
+                             pid == pids.get(name)))
+            checked.append((name, pid))
+    for name, pid in checked:
         ids = subjects[name]
         status = _proc_status(pid) or {}
         rows.append(_row("process", name, f"pid {pid} runs as uid {ids.uid} (real/effective/saved/fs)", True,
@@ -1957,6 +2297,8 @@ def config_checks(paths: ServicePaths, env: Mapping[str, str] | None = None) -> 
 
 
 def _not_root_only(tree: Path) -> list[str]:
+    """Entries of a mirror that are not root's alone, including symlinks whose resolution passes through anything
+    a service could change (``check_link_target``)."""
     out = []
     for dirpath, dirnames, filenames in os.walk(tree, onerror=lambda _e: None):
         for name in dirnames + filenames:
@@ -1967,7 +2309,103 @@ def _not_root_only(tree: Path) -> list[str]:
                 continue
             if st.st_uid != 0 or (not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o7022):
                 out.append(path)
+            elif stat.S_ISLNK(st.st_mode):
+                try:
+                    check_link_target(os.readlink(path), Path(dirpath))
+                except (IsolationError, OSError) as exc:
+                    out.append(f"{path} ({exc})")
     return out
+
+
+def tcp_listeners() -> dict[int, list[tuple[str, int]]]:
+    """port -> [(address, uid)] of every listening TCP socket, IPv4 and IPv6 (/proc/net/tcp{,6}: root here may lack
+    CAP_SYS_PTRACE, so sockets are attributed by uid, not by pid)."""
+    import ipaddress
+
+    out: dict[int, list[tuple[str, int]]] = {}
+    for table, width in (("/proc/net/tcp", 4), ("/proc/net/tcp6", 16)):
+        try:
+            with open(table, encoding="ascii") as fh:
+                lines = fh.read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 8 or fields[3] != "0A":
+                continue
+            hex_addr, hex_port = fields[1].split(":")
+            raw = bytes.fromhex(hex_addr)
+            raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))  # each 32-bit word is host order
+            addr = str(ipaddress.ip_address(raw)) if len(raw) == width else hex_addr
+            out.setdefault(int(hex_port, 16), []).append((addr, int(fields[7])))
+    return out
+
+
+def listener_checks(expected: Mapping[int, tuple[str, int | None]],
+                    listeners: Mapping[int, Sequence[tuple[str, int]]] | None = None) -> list[Row]:
+    """Every listener, in either family and on any address ([::1] and [::] included), on each expected port must
+    belong to the expected uid: a service listening where a client dials a name (e.g. localhost -> ::1) could
+    collect credentials. SKIP when nothing listens on a port."""
+    listeners = tcp_listeners() if listeners is None else listeners
+    rows = []
+    for port, (owner, uid) in sorted(expected.items()):
+        found = listeners.get(port, [])
+        if not found:
+            rows.append(Row("process", owner, f"something listens on :{port}", "yes", "no", "SKIP"))
+        for addr, actual in found:
+            rows.append(_row("process", owner, f"listener {addr}:{port} belongs to uid {uid}", True, actual == uid))
+    return rows
+
+
+def _expected_listeners(values: Mapping[str, str]) -> dict[int, tuple[str, int | None]]:
+    from urllib.parse import urlsplit
+
+    switch_port = urlsplit(resolve_switch_url(values)).port or 80
+    expected: dict[int, tuple[str, int | None]] = {switch_port: ("switch", 0)}
+    for name, port in (("proxy", 9000), ("legacy", 9001), ("modern", 9002)):
+        pw = _lookup(pwd.getpwnam, COMPONENTS[name].user)
+        expected[port] = (name, pw.pw_uid if pw else None)
+    return expected
+
+
+LLM_CLI_FIX = ("install the LLM CLI outside /root (root-owned, e.g. /usr/local/bin) and pass its key with "
+               "STRANGLER_TRANSLATOR_PASS_ENV")
+
+
+def _find_executable(word: str, search: str) -> str | None:
+    """As the current (dropped) user: where ``word`` resolves on ``search`` (a PATH), if executable for it."""
+    candidates = [word] if "/" in word else [os.path.join(d or ".", word) for d in search.split(":")]
+    for path in candidates:
+        if os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def llm_cli_check(ids: Ids, env: Mapping[str, str] | None = None) -> Row:
+    """In LLM mode the translator runs ``STRANGLER_LLM_CMD``: its first word must resolve, as the translator's user
+    and on the translator's PATH, to an executable whose whole resolution chain only root can modify. SKIP in the
+    deterministic mode."""
+    import shlex
+
+    values = _values(env)
+    mode = (values.get("STRANGLER_TRANSLATOR_MODE") or "deterministic").strip().lower()
+    check = "LLM CLI (first word of STRANGLER_LLM_CMD) runs for sr-translator"
+    if mode != "llm":
+        return Row("smoke", "translator", check, "-", f"mode {mode}", "SKIP")
+    from agents.llm_synth import DEFAULT_LLM_CMD
+
+    words = shlex.split(values.get("STRANGLER_LLM_CMD") or DEFAULT_LLM_CMD)
+    if not words:
+        return Row("smoke", "translator", check, "found", f"empty command; {LLM_CLI_FIX}", "FAIL")
+    found = run_as(ids, _find_executable, words[0], values.get("PATH") or "/usr/bin:/bin")
+    if found is None:
+        return Row("smoke", "translator", check, "found", f"{words[0]} not found or not executable for "
+                   f"sr-translator: {LLM_CLI_FIX}", "FAIL")
+    try:
+        check_link_target(found, Path("/"))
+    except IsolationError as exc:
+        return Row("smoke", "translator", check, "root-only", f"{found}: {exc}; {LLM_CLI_FIX}", "FAIL")
+    return Row("smoke", "translator", check, "found", found, "PASS")
 
 
 def verify(env: Mapping[str, str] | None = None, *, roots: Iterable[str] = SCAN_ROOTS) -> tuple[bool, list[Row]]:
@@ -1989,13 +2427,20 @@ def verify(env: Mapping[str, str] | None = None, *, roots: Iterable[str] = SCAN_
         rows += run_probes(name, ids, access_probes(name, paths, repo_state, pids=pids))
         if os.path.lexists(paths.python):
             ok, output = smoke(name, ids, paths)
-            rows.append(Row("smoke", name, f"{paths.python} imports {COMPONENTS[name].module} as {COMPONENTS[name].user}",
-                            "ok", "ok" if ok else (output.splitlines() or ["failed"])[-1][:60], "PASS" if ok else "FAIL"))
+            comp = COMPONENTS[name]
+            rows.append(Row("smoke", name, f"{paths.python} imports {comp.module} as {comp.user}", "ok",
+                            "ok" if ok else (output.splitlines() or ["failed"])[-1][:60], "PASS" if ok else "FAIL"))
+    if "translator" in subjects:
+        rows.append(llm_cli_check(subjects["translator"], values))
     secrets = secret_values(repo_state, repo_root(), env=values)
     if subjects:
         rows += secret_scan(subjects, secrets, [str(paths.home), *roots],
                             own_keys={c.name: str(paths.key(c)) for c in COMPONENTS.values() if c.agent})
     rows += process_checks(subjects, secrets, pids)
+    try:
+        rows += listener_checks(_expected_listeners(values))
+    except IsolationError as exc:
+        rows.append(Row("process", "-", "listeners on the Switch and target ports", "checked", str(exc), "FAIL"))
     return all(r.status != "FAIL" for r in rows), rows
 
 
@@ -2078,15 +2523,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             for line in disable(purge=bool(rest)):
                 print(line)
             return 0
-        if cmd in ("reset", "clean") and not rest:
+        if cmd == "reset" and not rest:
             if not isolation_on():
-                print(f"isolation is off: nothing to {cmd}")
+                print("isolation is off: nothing to reset")
                 return 0
             _require_root(cmd)
-            paths = _ready_paths(os.environ)
-            if cmd == "clean":
-                _refuse_while_running("clean", None)
-            for line in (reset(paths) if cmd == "reset" else clean(paths)):
+            for line in reset(_ready_paths(os.environ)):
+                print(line)
+            return 0
+        if cmd == "clean" and not rest:
+            # whatever the mode: a service area that exists is emptied (no key copy outlives isolation)
+            paths = clean_target(os.environ)
+            if paths is None:
+                print("no service area: nothing to clean")
+                return 0
+            _require_root(cmd)
+            _refuse_while_running("clean", None)
+            for line in clean(paths):
                 print(line)
             return 0
         if cmd == "verify" and not rest:

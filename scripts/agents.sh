@@ -142,6 +142,8 @@ start_one() {
     cd "$ROOT"
     export PYTHONPATH="$ROOT"
     export PYTHONUNBUFFERED=1
+    # isolated: the launcher must find isolation on too (a marker gone meanwhile is an error, never "off")
+    if [ -n "${ISOLATE:-}" ]; then export STRANGLER_ISOLATION=on; fi
     # Isolated, the same command runs through `agents.isolation exec`, which execs (the pid stays the agent's).
     nohup ${ISOLATE:+"$PYTHON" -m agents.isolation exec "$name" --} "$PYTHON" -m "$module" >>"$log" 2>&1 </dev/null 9>&- &
     printf '%s\n' "$!" >"$(pid_file "$name")"
@@ -156,7 +158,10 @@ start_one() {
       sleep 0.2
     done
     if ! isolated_pid "$pid" "$name"; then
-      if is_agent_pid "$pid" "$module"; then kill -KILL "$pid" 2>/dev/null || true; fi  # never leave it running
+      if is_agent_pid "$pid" "$module"; then  # never leave it (or its children) running
+        pkill -KILL -P "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
       rm -f "$(pid_file "$name")"
       echo "error: $name did not start as sr-$name; see $log" >&2
       exit 1
