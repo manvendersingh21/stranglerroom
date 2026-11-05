@@ -334,7 +334,8 @@ agent reads only `SWITCH_URL`, from the environment or `connection.env` (`Settin
 `switch.env`, so it never holds the registration token, the admin password or the human's password. Environment
 variables override the files.
 
-CI (`.github/workflows/e2e.yml`) has two jobs. `unit` runs `make install` and `make test`. `e2e` runs
+CI (`.github/workflows/e2e.yml`) has two jobs. `unit` runs `make install` and `make test`, then the isolation tests as
+root (`sudo -E`). `e2e` runs
 `SWITCH_MODE=docker bash scripts/bootstrap_switch.sh`, `make install` and `make e2e`. It then creates switch-core's venv
 (`uv sync --frozen --no-dev --project .switch-infra/core`) and runs `validate_template.py --run`. On failure or
 cancellation it uploads `.state/run/*.log` and the compose logs.
@@ -462,7 +463,7 @@ make isolate-verify     # (isolated hosts) live isolation proof              →
 
 | Layer | Count | What |
 |---|---|---|
-| Unit (no live Switch) | **1,022** in 28 files: the template-engine tests skip without `.switch-infra/core/.venv`, and two isolation tests need a host without the `sr-*` users, so they skip on the isolated dev box and run in CI | per-component isolation (212: launcher, privilege drop, mirrors, setup/disable, verify, and the scripts' isolated paths, all against temporary fixtures, never the host), state layout and least privilege (21), targets contract and adversarial cases (71), codegen (277), divergence engine (24), the three agents (131, including fuzzer edge cases, governance/replay/history regressions and the production lock), driver logic (86), ops scripts (42), template (39 offline), CI workflow (12), … |
+| Unit (no live Switch) | **1,022** in 28 files: the template-engine tests skip without `.switch-infra/core/.venv`; two isolation tests need a host without the `sr-*` users, so they skip on the isolated dev box. CI's `unit` job runs `make test` as its non-root user, then the isolation tests again as root on a clean runner, which covers the launcher's root-only paths | per-component isolation (212: launcher, privilege drop, mirrors, setup/disable, verify, and the scripts' isolated paths, all against temporary fixtures, never the host), state layout and least privilege (21), targets contract and adversarial cases (71), codegen (277), divergence engine (24), the three agents (131, including fuzzer edge cases, governance/replay/history regressions and the production lock), driver logic (86), ops scripts (42), template (39 offline), CI workflow (12), … |
 | In-process end-to-end (part of the 1,022) | 3 | `test_agents_loop.py`: the three real agents in a `FakeRoom` against real target subprocesses, the full loop plus a restart and replay. `test_parity_integration.py`: D-1..D-5 → 5/5 plus a `deprecated-violated` negative control |
 | Live integration (`-m integration`) | **2** | `test_switch_integration.py::test_switch_client_end_to_end` (throwaway agents) and `test_template.py::test_live_validate_run_and_archive` |
 | Live end-to-end | **35 checks** | `scripts/run_e2e_demo.py` against the real stack. Runs 2–7 all exited 0 (run 1 exposed a `targets.sh` hang, since fixed). Then 2 × `--fresh` and 1 × `--cinema --fresh`, each 35/35. After the critic's governance hardening: `make demo` and `run_e2e_demo.py --fresh`, each 35/35. Final recorded `--cinema --fresh` run (§5): 35/35, followed by `--fresh` verification runs after the final hardening (per-deployment router token; paged approval lookup and stricter replay checks), each 35/35. With isolation on (every component as its own Unix user from `/srv/stranglerroom`): three `--fresh` runs, each 35/35, after the second and third review rounds |

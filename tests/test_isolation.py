@@ -932,7 +932,9 @@ def test_exec_with_isolation_on_but_no_users_exits_2_without_running(tmp_path):
     # ... and with isolation on, without the service users, it is refused before anything runs or is created
     r = _cli("exec", "proxy", "--", *command,
              env={**marker, "STRANGLER_ISOLATION": "on", "STRANGLER_STATE_DIR": str(tmp_path / "state")})
-    assert r.returncode == 2 and "sr-proxy does not exist" in r.stderr, r.stderr
+    # as root the missing users stop it; as non-root (CI) the launcher refuses even earlier: either way exit 2, nothing ran
+    expected = "sr-proxy does not exist" if os.geteuid() == 0 else "not root"
+    assert r.returncode == 2 and expected in r.stderr, r.stderr
     assert not flag.exists() and not (tmp_path / "srv").exists() and not (tmp_path / "state").exists()
 
 
@@ -1724,6 +1726,7 @@ def test_config_checks_and_status_report_problems(tmp_path, world_tmp, checkout,
     assert "mode: error: isolation setup incomplete" in lines and "setting-up" in lines
 
 
+@requires_root  # pid files are read like status/verify do, as root: only through a root-owned run dir
 def test_live_pid_trusts_only_a_live_process_running_the_module(tmp_path):
     env = {"STRANGLER_STATE_DIR": str(tmp_path)}
     run = tmp_path / "run"
@@ -2028,6 +2031,7 @@ def _kill_uid(uid: int) -> None:
                 continue
 
 
+@requires_root  # pid files are read like status/verify do, as root: only through a root-owned run dir
 def test_tracked_pid_reads_the_pid_file_regardless_of_argv(tmp_path):
     env = {"STRANGLER_STATE_DIR": str(tmp_path)}
     (tmp_path / "run").mkdir()
@@ -2439,6 +2443,7 @@ def test_unknown_mode_stop_reads_no_pid_file(tmp_path, script, pid_name):
     assert any(line.startswith("pgrep") for line in calls.read_text().splitlines())
 
 
+@requires_root  # pid files are read like status/verify do, as root: only through a root-owned run dir
 def test_python_reads_pid_files_only_through_a_validated_run_dir(tmp_path):
     """codex round 3 #4: descriptor-relative, O_NOFOLLOW, regular files only, at most 64 bytes."""
     env = {"STRANGLER_STATE_DIR": str(tmp_path)}
