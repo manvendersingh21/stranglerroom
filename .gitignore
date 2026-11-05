@@ -12,3 +12,4 @@
 __pycache__/
 targets/modern_fastapi/app/lists.py
 .claude/
+tmp_review/

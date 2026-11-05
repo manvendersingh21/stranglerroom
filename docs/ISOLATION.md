@@ -1,6 +1,6 @@
 # Per-component OS users ("isolation")
 
-Status: design spec, revision 2. Revision 1 opened `/root` to the service users; the codex design review
+Status: implemented (`agents/isolation.py`), revision 2. Revision 1 opened `/root` to the service users; the codex design review
 (`.hacp/reviews/isolation-design.md`) rejected that, and this revision replaces it.
 
 ## 1. Why, and what it guarantees
@@ -113,15 +113,21 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
 
 1. checks the marker and that `euid == 0`;
 2. refreshes the mirrors and prepares the component's part of the service area (§2.2): private dir, API key and
-   `room.json` copies for agents, the production lock for translator and gate, the module dir for the translator;
-3. rewrites argv: `[<checkout python>, "-m", <module>, …]` becomes `[SERVICE_HOME/venv/bin/python, "-m", <module>, …]`
-   with cwd `SERVICE_HOME/app`. Any other argv shape is refused, and so is a module other than the component's own;
+   `room.json` copies for agents, the production lock for translator and gate, the module dir (owned by the
+   translator; also created when the modern server starts first, because it serves from that directory). The mode of
+   a service-owned directory is restored through its no-follow descriptor, so a `chmod 0777` by its owner does not
+   survive a relaunch. Mirrored files lose group/other write and set-id bits; a mirrored symlink must stay inside its
+   tree or point at a path only root can modify;
+3. rewrites argv: `[<python>, "-m", <module>, …]` becomes `[SERVICE_HOME/venv/bin/python, "-m", <module>, …]`
+   (argv[0] is discarded), with cwd `SERVICE_HOME/app`. Any other argv shape is refused, and so is a module other than
+   the component's own;
 4. builds the environment from **that component's** schema, not from a prefix wildcard:
    * every component gets `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `PYTHONUNBUFFERED`, `STRANGLER_LOG_LEVEL`;
    * agents get `STRANGLER_AGENT_PACE`, `LEGACY_URL`, `MODERN_URL`, `PROXY_URL`, and `SWITCH_URL` (from the
-     environment, else read from the checkout's `switch.env` as root, else the default);
+     environment, else the checkout's public `connection.env`, else the default; never `switch.env`);
    * the translator also gets `STRANGLER_TRANSLATOR_MODE`, `STRANGLER_LLM_CMD`, and the variables named in
-     `STRANGLER_TRANSLATOR_PASS_ENV` (comma-separated, for LLM credentials);
+     `STRANGLER_TRANSLATOR_PASS_ENV` (comma-separated, for LLM credentials). Naming `LD_*`, `PYTHON*`,
+     `STRANGLER_ISOLATION*` or any `switch.env`/Switch `.env` secret there is an error, not a silent skip;
    * the proxy gets `LEGACY_URL` and `MODERN_URL`;
    * the modern server gets `MODERN_NO_RELOAD`;
    * set last by the launcher, overriding anything above: `STRANGLER_STATE_DIR=SERVICE_HOME/state`,
@@ -132,17 +138,25 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
    * finally removed from every other component: `ROUTER_ADMIN_TOKEN`, `ROUTER_TOKEN_FILE`. A pass-through name
      can never set a launcher-set or forbidden variable;
 5. starts a new session (`setsid`; failure is an error), closes every inherited descriptor except 0, 1 and 2, sets
-   the supplementary groups, gid and uid (real, effective and saved), checks that `setuid(0)` now fails, sets
-   `umask 077`, and `execve`s the component. The recorded pid is therefore the component itself.
+   the supplementary groups, gid and uid (real, effective and saved), sets `no_new_privs`, checks that `setuid(0)`
+   now fails and that the permitted, effective and ambient capability sets are empty, sets `umask 077`, changes to
+   `SERVICE_HOME/app` and `execve`s the component. The recorded pid is therefore the component itself.
 
 ### Scripts
 
-* With isolation on, "already running" means a live tracked pid **whose uid is the component's user**. A
-  component found running as another uid, or a healthy port with no tracked isolated process, is an error naming the
-  fix (`restart` or `stop`), never "already up".
+* The mode is decided once, before any `mkdir`, lock or log; `mode --run-dir DIR` also validates the run directory
+  when isolation is on (every path component root-owned and not writable by others unless sticky; the directory
+  itself 0700). Logs are created 0600.
+* With isolation on, "already running" means a live tracked pid whose four uids are all the component's user and
+  whose command line no longer holds `-m agents.isolation`; for a target, its user must also own the listening socket
+  (`/proc/net/tcp`). A component found running as another uid, or a healthy port with no tracked isolated process, is
+  an error naming the fix (`restart` or `stop`), never "already up". A launch that does not come up isolated is
+  killed, and `stop` also signals any stray process of the service users (`pkill -u`).
 * `targets.sh start --fresh` with isolation on also runs `python -m agents.isolation reset`. This unlinks
   `proxy/router.json`, `fuzzer/divergence_registry.json` (and `.staging`) and `module/lists.py` in the service area.
-* `make clean-state` with isolation on also runs `python -m agents.isolation clean`, which empties `SERVICE_HOME/state`.
+* `make clean-state` with isolation on also runs `python -m agents.isolation clean`, which empties `SERVICE_HOME/state`:
+  each entry is first renamed inside the root-only `state/`, then removed with the descriptor-based `shutil.rmtree`
+  (no path an owner can swap is ever followed). `clean-state` keeps `switch.env` and `connection.env`.
 * The run directory must be root-owned and not group- or other-writable. The default `.state/run` under the 0700
   checkout is out of every service's reach.
 
@@ -153,8 +167,10 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
 * refuses while any StranglerRoom component is running (stop them first);
 * writes the marker with `"state": "setting-up"` first, then creates the group `sr-prodlock` and the six system
   users (no login shell, home `/nonexistent`, primary group named after the user, `sr-prodlock` for translator and
-  gate), creates `SERVICE_HOME`, fills the mirrors, and finally marks it `ready`. It is idempotent: re-running it
-  repairs or updates an existing installation;
+  gate), creates `SERVICE_HOME`, fills the mirrors, prepares every component, runs the startup smoke import as every
+  service user, and only then marks it `ready` (a failure leaves `setting-up`, which `mode` reports as an error). It
+  is idempotent: re-running it repairs or updates an existing installation. "Running" here means any process with a
+  `-m <component module>` pair or any service uid; it also gates `clean`;
 * never changes the permissions of `/root`, the checkout or anything outside `SERVICE_HOME`, `/etc/passwd`,
   `/etc/group` and the marker.
 
@@ -181,9 +197,11 @@ Exit status 0 only if every check passes; prints one table.
    (files over 8 MB are skipped). Search for every secret value: `switch.env` and Switch `.env` passwords, tokens and
    keys, the router token, the three API keys, and the Mattermost database password. Any hit fails, except a user's
    own API key in its own key copy.
-5. **Live processes** (when running): each component's uid matches its user; each has its own session;
-   `ROUTER_ADMIN_TOKEN` is in the environment of proxy and gate only; no secret value appears in any process's
-   command line.
+5. **Live processes** (when running; a component that is not running is reported SKIP): each component's uids and
+   groups match its user; each has its own session; signals across components are refused;
+   `ROUTER_ADMIN_TOKEN` is in the environment of proxy and gate only (root lacks `CAP_SYS_PTRACE` here, so each
+   process's `/proc/<pid>/environ` is read as that process's own user); no secret value appears in any process's
+   command line. A secret shorter than 8 characters cannot be searched for reliably and is reported SKIP.
 
 ## 7. Interfaces (`agents/isolation.py`)
 
@@ -199,7 +217,7 @@ class Component:
     agent: bool                # API key + room.json copies, SWITCH_URL
     router_token: bool         # ROUTER_ADMIN_TOKEN
     production_lock: bool      # member of LOCK_GROUP
-    module_writer: bool        # owns SERVICE_HOME/state/module
+    module_writer: bool        # owns SERVICE_HOME/state/module (Ids.module_owner: the translator's uid/gid)
     env_keys: tuple[str, ...]  # component-specific pass-through names (section 4)
 
 COMPONENTS: dict[str, Component]
@@ -214,5 +232,6 @@ def sync_mirrors(repo: Path, paths) -> list[str]        # actions taken
 def prepare(component, ids, paths, repo_state: Path) -> list[str]
 def reset(paths) -> list[str]
 def drop_privileges(uid: int, gid: int, groups: list[int]) -> None
-def secret_values(repo_state: Path, repo: Path) -> dict[str, str]  # label -> value, for verify
+def secret_values(repo_state: Path, repo: Path, *, env=None) -> dict[str, str]  # label -> value, for verify
+                                                  # (env: ROUTER_ADMIN_TOKEN / ROUTER_TOKEN_FILE / MM DSN overrides)
 ```

@@ -37,6 +37,10 @@ def wait_http(url: str, timeout: float = 30.0) -> None:
 @contextmanager
 def service(module: str, port: int, health: str = "/health", env: dict | None = None, args: list[str] | None = None):
     e = dict(os.environ)
+    if not (env and "STRANGLER_STATE_DIR" in env):
+        # A spawned target resolves its default files (the legacy log, the proxy's router.json and token) under the
+        # state dir: never the real deployment's .state (conftest.py makes this a per-session temp dir).
+        e["STRANGLER_STATE_DIR"] = os.environ["STRANGLER_TEST_SERVICE_STATE_DIR"]
     e.update(env or {})
     e["PYTHONPATH"] = str(ROOT)
     proc = subprocess.Popen([sys.executable, "-m", module, "--port", str(port), *(args or [])], cwd=ROOT, env=e,
