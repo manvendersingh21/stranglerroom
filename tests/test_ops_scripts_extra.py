@@ -17,7 +17,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = ("translator", "fuzzer", "cutover-gate")
 TARGETS = ["help", "install", "switch-up", "switch-down", "targets", "provision", "agents", "agents-stop", "test",
-           "test-integration", "e2e", "demo", "cinema", "stop", "clean-state"]
+           "test-integration", "e2e", "demo", "cinema", "stop", "clean-state",
+           "isolate", "isolate-verify", "isolate-off"]
 
 
 def run(*args, env=None):
@@ -181,6 +182,9 @@ def test_makefile_recipes_use_real_clis():
     stop = run("make", "-n", "stop").stdout
     assert stop.index("agents.sh stop") < stop.index("targets.sh stop") < stop.index("bootstrap_switch.sh stop")
     assert "-m 'not integration'" in run("make", "-n", "test").stdout
+    assert "agents.isolation setup" in run("make", "-n", "isolate").stdout
+    assert "agents.isolation verify" in run("make", "-n", "isolate-verify").stdout
+    assert "agents.isolation disable" in run("make", "-n", "isolate-off").stdout
     assert "-m integration" in run("make", "-n", "test-integration").stdout
     e2e = run("make", "-n", "e2e").stdout
     assert "run_e2e_demo.py" in e2e and "--fresh" in e2e and "--cinema" not in e2e

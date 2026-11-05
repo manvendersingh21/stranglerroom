@@ -5,14 +5,28 @@
 #
 # Each agent runs as `$PYTHON -m <prefix><module>` in the background, with
 # PYTHONPATH set to the repository root and its PID/log files stored under
-# $STRANGLER_RUN_DIR (default: $ROOT/.state/run).  Only PIDs read from our own
+# $STRANGLER_RUN_DIR (default: $STATE/run, the directory targets.sh uses; STATE
+# is ${STRANGLER_STATE_DIR:-$ROOT/.state}).  Only PIDs read from our own
 # PID files are ever signalled, and only after verifying both that the process
 # is alive and that its /proc/<pid>/cmdline still names the expected module.
+#
+# Isolation (docs/ISOLATION.md §4): `python -m agents.isolation mode` decides
+# once whether each agent runs as its own OS user. When it is on, `mode
+# --run-dir` has already checked (creating it if need be) $RUN as a root-owned
+# 0700 directory on a path no service can modify, before this script touches
+# any file in it; each agent is launched through `agents.isolation exec`, which
+# execs into the agent (the recorded pid stays the agent's), and an agent only
+# counts as running once it runs as its sr-<name> user.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
-RUN="${STRANGLER_RUN_DIR:-$ROOT/.state/run}"
+STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"
+case "$STATE" in
+  /*) ;;
+  *) STATE="$ROOT/$STATE" ;;
+esac
+RUN="${STRANGLER_RUN_DIR:-$STATE/run}"
 PREFIX="${AGENTS_MODULE_PREFIX:-agents.}"
 
 # Keep paths independent of the caller's current working directory.
@@ -20,6 +34,17 @@ case "$RUN" in
   /*) ;;
   *) RUN="$ROOT/$RUN" ;;
 esac
+
+ISOLATE=""
+mode="$(cd "$ROOT" && PYTHONPATH="$ROOT" "$PYTHON" -m agents.isolation mode --run-dir "$RUN")" \
+  || { echo "error: cannot determine the isolation mode (see above); refusing to start or stop anything" >&2; exit 2; }
+case "$mode" in
+  on) ISOLATE=1 ;;
+  off) ;;
+  *) echo "error: unexpected isolation mode '$mode'" >&2; exit 2 ;;
+esac
+# Isolated: pid files and logs are root's alone (an agent could otherwise reopen its log via /proc/self/fd/1).
+if [ -n "$ISOLATE" ]; then umask 077; fi
 
 AGENT_NAMES=(translator fuzzer cutover-gate)
 
@@ -63,6 +88,21 @@ is_agent_pid() {
   return 1
 }
 
+# Isolated only: true if <pid> has finished the isolated exec. All four of its
+# uids are sr-<name>'s, and it no longer runs the root launcher, whose argv
+# (`-m agents.isolation exec <name> -- … -m <module>`) would satisfy
+# is_agent_pid() too.
+isolated_pid() { # pid name
+  local pid="$1" want uids args=() i
+  want="$(id -u "sr-$2" 2>/dev/null)" || return 1
+  uids="$(awk '/^Uid:/ {print $2, $3, $4, $5}' "/proc/$pid/status" 2>/dev/null)" || return 1
+  [ "$uids" = "$want $want $want $want" ] || return 1
+  mapfile -d '' -t args 2>/dev/null <"/proc/$pid/cmdline" || return 1
+  for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+    if [ "${args[i]}" = "-m" ] && [ "${args[i+1]}" = "agents.isolation" ]; then return 1; fi
+  done
+}
+
 # Echo the live PID for <name> if (and only if) it belongs to our agent module.
 agent_pid() {
   local name="$1" module pid
@@ -82,6 +122,11 @@ start_one() {
 
   pid="$(agent_pid "$name")"
   if [ -n "$pid" ]; then
+    if [ -n "${ISOLATE:-}" ] && ! isolated_pid "$pid" "$name"; then
+      echo "error: $name (pid $pid) is running, but not as sr-$name — run 'scripts/agents.sh restart' to run it" \
+           "isolated (or 'stop')" >&2
+      exit 1
+    fi
     echo "$name already running pid=$pid"
     return 0
   fi
@@ -91,17 +136,32 @@ start_one() {
   mkdir -p "$RUN"
   printf '=== %s start %s (%s) ===\n' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$name" "$module" >>"$log"
+  if [ -n "${ISOLATE:-}" ]; then chmod 0600 "$log"; fi  # an older log may be 0644
 
   (
     cd "$ROOT"
     export PYTHONPATH="$ROOT"
     export PYTHONUNBUFFERED=1
-    nohup "$PYTHON" -m "$module" >>"$log" 2>&1 </dev/null 9>&- &
+    # Isolated, the same command runs through `agents.isolation exec`, which execs (the pid stays the agent's).
+    nohup ${ISOLATE:+"$PYTHON" -m agents.isolation exec "$name" --} "$PYTHON" -m "$module" >>"$log" 2>&1 </dev/null 9>&- &
     printf '%s\n' "$!" >"$(pid_file "$name")"
   )
 
   pid="$(read_pid "$name")"
   sleep 0.5
+  if [ -n "${ISOLATE:-}" ]; then
+    # The root launcher's argv names the module too: wait (<= 30 s) until it has exec'd into sr-<name>.
+    for _ in $(seq 1 150); do
+      if isolated_pid "$pid" "$name" || ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.2
+    done
+    if ! isolated_pid "$pid" "$name"; then
+      if is_agent_pid "$pid" "$module"; then kill -KILL "$pid" 2>/dev/null || true; fi  # never leave it running
+      rm -f "$(pid_file "$name")"
+      echo "error: $name did not start as sr-$name; see $log" >&2
+      exit 1
+    fi
+  fi
   if ! is_agent_pid "$pid" "$module"; then
     echo "error: $name failed to start; see $log" >&2
     exit 1
@@ -129,6 +189,8 @@ stop_all() {
   for name in "${AGENT_NAMES[@]}"; do
     pid="$(agent_pid "$name")"
     [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+    # Isolated: whatever else runs as sr-<name> (e.g. a daemon a compromised agent forked) goes too.
+    if [ -n "${ISOLATE:-}" ]; then pkill -KILL -u "sr-$name" 2>/dev/null || true; fi
     rm -f "$(pid_file "$name")"
   done
 }
