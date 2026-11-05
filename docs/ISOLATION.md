@@ -1,172 +1,217 @@
 # Per-component OS users ("isolation")
 
-Status: design spec (implementation in progress on branch `per-user-isolation`).
+Status: design spec, revision 2. Revision 1 opened `/root` to the service users; the codex design review
+(`.hacp/reviews/isolation-design.md`) rejected that, and this revision replaces it.
 
-## 1. Why
+## 1. Why, and what it guarantees
 
 Without isolation every StranglerRoom process runs as the operator (root on the demo host). Any one of them, or code
-it executes (the translator-generated `app/lists.py` running inside the modern server, an LLM-synthesised module),
-can then read every secret on the host:
+it executes (the translator-generated module running inside the modern server, an LLM-synthesised module), can then
+read every secret on the host:
 
-* the other agents' Switch API keys (`.state/agents/*.json`), so it can speak as another agent;
-* the router token (`.state/router.token`), so it can flip production with `POST /_router/flip`;
+* the other agents' Switch API keys, so it can speak as another agent;
+* the router token, so it can flip production with `POST /_router/flip`;
 * `.state/switch.env`, which holds the Switch registration token, the gateway admin password **and the human lead's
-  Mattermost password**, so it can impersonate the human and issue the human-only verbs (`approve-cutover`, …).
+  Mattermost password**, so it can impersonate the human and issue the human-only verbs.
 
-Isolation runs every component as its own unprivileged Unix user, so the kernel's file permissions keep each secret
-with its one legitimate holder.
+Isolation runs every component as its own unprivileged Unix user, from a **service area** outside the operator's
+home (`/srv/stranglerroom`). The operator's checkout, its `.state/` and `/root` keep their current permissions (0700),
+so no service user can reach any of them. Each service receives a copy of exactly what it needs.
 
-| component | Unix user | supplementary groups | can read (besides code) | can write |
+| component | Unix user | supplementary groups | receives | can write |
 |---|---|---|---|---|
-| translator | `sr-translator` | `stranglerroom`, `sr-prodlock` | its own API key, `room.json` | `.state/translator/`, its own files in `targets/modern_fastapi/app/` (sticky dir), `production.lock` |
-| fuzzer | `sr-fuzzer` | `stranglerroom` | its own API key, `room.json` | `.state/fuzzer/` |
-| cutover-gate | `sr-cutover-gate` | `stranglerroom`, `sr-prodlock` | its own API key, `room.json`, the router token (environment only) | `.state/cutover-gate/`, `production.lock` |
-| proxy | `sr-proxy` | `stranglerroom` | the router token (environment only) | `.state/proxy/` |
-| legacy | `sr-legacy` | `stranglerroom` | — | `.state/legacy/` |
-| modern | `sr-modern` | `stranglerroom` | the generated `app/lists.py` | `.state/modern/` |
+| translator | `sr-translator` | `sr-prodlock` | its own API key (copy), `room.json` (copy) | its private dir, the module dir, `production.lock` |
+| fuzzer | `sr-fuzzer` | — | its own API key (copy), `room.json` (copy) | its private dir |
+| cutover-gate | `sr-cutover-gate` | `sr-prodlock` | its own API key (copy), `room.json` (copy), the router token (environment only) | its private dir, `production.lock` |
+| proxy | `sr-proxy` | — | the router token (environment only) | its private dir |
+| legacy | `sr-legacy` | — | — | its private dir |
+| modern | `sr-modern` | — | read access to the generated module | its private dir |
 
-No component can read `switch.env`, `router.token`, another component's API key, the process logs (`.state/run/`,
-0700), `.switch-infra/` or `.native/`. None can signal or ptrace another component's process (different uids).
-None can write the code tree, except that the translator can add and replace **its own** files in the one
-directory that holds the module it generates (sticky bit: it cannot replace `main.py` or `store.py`).
+**Guarantees** (enforced by the kernel's file permissions and signal rules):
 
-**Still trusted:** the operator (root), who runs bootstrap, provisioning, the launchers and the e2e driver.
-**Out of scope:** Switch, Mattermost and Postgres themselves (unchanged; they authenticate their clients); other
-services on the host; a component binding a port that happens to be free; per-user network egress rules (this
-pod has no `CAP_NET_ADMIN`).
+* a service cannot read the operator's files (`switch.env`, `router.token`, the master API keys, logs), another
+  service's API key, private directory or environment;
+* a service cannot write the code it or any other service runs, except that the translator writes the one generated
+  module (its job), which the modern server serves;
+* a service cannot signal or ptrace another service's processes (different uids, separate sessions).
 
-## 2. State layout (the same in both modes)
+**Not guaranteed** (an authority stays an authority): a compromised translator can publish any module and ignore the
+advisory production lock; a compromised cutover gate holds the router token and can flip without a real approval; a
+compromised proxy routes as it likes. Isolation limits each compromise to that component's own authority; it does not
+make a component's authority conditional on the others. Also out of scope: Switch, Mattermost and Postgres themselves
+(they authenticate their clients), other services on the host, a service binding a port that happens to be free, and
+browser cookies. Cookies are host-scoped, not port-scoped: browse the targets at `127.0.0.1`, not at `localhost`
+where Mattermost's session cookie lives. The proxy also drops Mattermost's and the Gateway's auth cookies before
+forwarding.
 
-Every file a component writes lives in that component's own directory, so each directory can be owned by a
-different user. Paths honour `STRANGLER_STATE_DIR` (default `<repo>/.state`).
+## 2. Layouts
+
+### 2.1 The checkout's `.state/` (both modes; the operator's)
+
+Every file a component writes lives in that component's own directory. Paths honour `STRANGLER_STATE_DIR`.
 
 ```
-.state/
-  switch.env            operator only (0600 root). Agents never read it; they get SWITCH_URL from the launcher.
-  router.token          operator only (0600 root). Proxy and gate receive the value in their environment.
-  room.json             0644 root (room id, channel, names: not secret)
-  production.lock       root:sr-prodlock 0660 when isolated
-  agents/               0711 root when isolated (traverse only)
-    translator.json     sr-translator 0600         (and fuzzer.json, cutover-gate.json likewise)
-  translator/           sr-translator 0700   pending_refusals.json   (was .state/translator_pending_refusals.json)
-  fuzzer/               sr-fuzzer 0700       divergence_registry.json (was .state/divergence_registry.json)
-  proxy/                sr-proxy 0700        router.json              (was .state/router.json)
-  legacy/               sr-legacy 0700       legacy_openlibrary.log   (was .state/legacy_openlibrary.log)
-  cutover-gate/ modern/ their users, 0700    HOME only
-  run/                  0700 root when isolated: pid files and logs (each process inherits its log descriptor)
+.state/  switch.env  router.token  room.json  production.lock  agents/<name>.json  run/
+         translator/pending_refusals.json   fuzzer/divergence_registry.json
+         proxy/router.json                  legacy/legacy_openlibrary.log
 ```
 
-The generated module stays at `targets/modern_fastapi/app/lists.py` (the path the ledger names). The translator
-publishes it as mode 0644 (the modern server is another user), and API-key files are created 0600 from the start
-(no window in which a temporary copy is readable by others).
+### 2.2 The service area (isolated mode only)
+
+`SERVICE_HOME` defaults to `/srv/stranglerroom` and is recorded in the marker.
+
+```
+/srv/stranglerroom/            root:root 0755
+  app/                         root-owned mirror of the checkout's agents/, targets/, docs/ (no __pycache__, *.pyc,
+                               nor the checkout's generated targets/modern_fastapi/app/lists.py)
+  venv/                        root-owned mirror of the checkout's .venv (its python links to the system interpreter)
+  state/                       root:root 0755, the STRANGLER_STATE_DIR of every service process
+    room.json                  root 0644 (copy)
+    agents/                    root 0711
+      <name>.json              <user> 0600 (copy; written by root: mkstemp in this root-owned dir, fchown, fchmod,
+                               fsync, rename)
+    production.lock            root:sr-prodlock 0660
+    module/                    sr-translator 0755: lists.py (0644), the MODERN_LISTS_PATH of translator and modern
+    translator/ fuzzer/ cutover-gate/ proxy/ legacy/ modern/   <user> 0700 (its private dir and HOME)
+```
+
+Rules:
+
+* **Root never writes inside a service-owned directory.** No "ownership repair": a service-owned directory is created
+  empty by root and then belongs to its service. The only root operation inside one is a reset's `unlink` of known
+  names, through a directory descriptor opened with `O_DIRECTORY|O_NOFOLLOW` whose owner has been checked (unlink
+  never follows the final component).
+* Every directory root writes into (`app/`, `venv/`, `state/`, `state/agents/`) is root-owned and not writable by any
+  service. Before writing, root checks that it is not a symlink and is owned by root.
+* The mirrors are refreshed by every isolated launch (only changed files; temp file plus rename), serialised by an
+  `flock` on `SERVICE_HOME/.sync.lock`.
 
 ## 3. Mode
 
 `STRANGLER_ISOLATION` = `off` | `on` | `auto` (default `auto`).
 
-* `auto`: on if and only if the marker `/etc/stranglerroom/isolation.json` (override: `STRANGLER_ISOLATION_MARKER`)
-  exists and its `"repo"` equals this checkout's resolved root. A CI runner or another checkout never picks it up.
-* `on` without a matching marker, or isolation on while the launcher is not root: fail loudly. Never fall back to
-  running unisolated.
-* The test suite forces `off` (autouse fixture), so tests never drop privileges or touch the host.
+* The marker is `/etc/stranglerroom/isolation.json` (override: `STRANGLER_ISOLATION_MARKER`):
+  `{"state": "setting-up"|"ready", "repo": "<resolved checkout>", "service_home": "/srv/stranglerroom", …}`.
+* `auto`: on if and only if the marker exists, is `ready` and names this checkout. A marker that is not `ready` is an
+  error (exit 2: "isolation setup incomplete: re-run `make isolate` or `make isolate-off`"). A CI runner or another
+  checkout never picks the marker up.
+* `on` without a ready marker for this checkout, or isolation on while the caller is not root: error. Isolation never
+  silently falls back to off.
+* The test suite forces `off` (autouse fixture), so tests never drop privileges, sync mirrors or touch the host.
 
-## 4. Launcher: `python -m agents.isolation exec <component> -- <argv…>`
+## 4. Launcher: `python -m agents.isolation exec <component> -- <python> -m <module> [args…]`
 
-`scripts/agents.sh` and `scripts/targets.sh` decide the mode once (`python -m agents.isolation mode` prints `on` or
-`off`) and launch each process as
+The scripts decide the mode once, using `python -m agents.isolation mode`, which prints `on` or `off`. They launch
+each process as
 
 ```bash
 nohup ${ISOLATE:+"$PY" -m agents.isolation exec "$name" --} "$PY" -m "$module" … >>"$log" 2>&1 </dev/null 9>&- &
 ```
 
-so with isolation off nothing changes, and with it on the recorded pid still ends up as the component itself (each
-step `exec`s). When on, the launcher, as root:
+With isolation off, nothing changes. With it on, the launcher, running as root:
 
-1. **prepares** the component's files: symlink-safe (`O_NOFOLLOW`, `dir_fd` with `follow_symlinks=False`), never
-   recursive. It refuses a symlinked or foreign-owned directory instead of following it.
-   * `.state` exists, owned by root, not group- or other-writable;
-   * its private directory: owned by the component's user, mode 0700. Entries directly inside it that root created
-     (e.g. a `router.json` from an unisolated run) are `lchown`ed to the user;
-   * agents: `.state/agents` 0711 root; its own `<name>.json` is owned by its user, 0600;
-   * translator and gate: `.state/production.lock` root:sr-prodlock 0660 (created if missing);
-   * translator: the module directory (parent of `MODERN_LISTS_PATH`, default `targets/modern_fastapi/app`) is
-     root:sr-translator 1775, and an existing `lists.py` is owned by sr-translator and set to 0644;
-2. builds a **minimal environment** from an allow-list instead of inheriting root's:
-   * kept: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `PYTHONPATH`, `PYTHONUNBUFFERED`, `STRANGLER_*`,
-     `LEGACY_URL`, `MODERN_*`, `PROXY_URL`, `ROUTER_*`;
-   * always dropped: `ROUTER_ADMIN_TOKEN` and `ROUTER_TOKEN_FILE` (re-added below for proxy and gate only);
-   * set: `HOME` = its private directory, `USER`/`LOGNAME`, `PYTHONDONTWRITEBYTECODE=1`;
-   * agents: `SWITCH_URL` (from the environment, else read from `switch.env` as root, else the default);
-   * proxy and cutover-gate: `ROUTER_ADMIN_TOKEN` = `resolve_router_token()` evaluated as root (the same rule both
-     use unisolated), so the token never appears in a file they can read or in any argv (`/proc/<pid>/cmdline` is
-     world-readable; `/proc/<pid>/environ` is not);
-   * translator only: the variables named in `STRANGLER_TRANSLATOR_PASS_ENV` (comma-separated), e.g. an API key
-     for LLM mode;
-3. **drops privileges**: `setgroups(supplementary)`, `setgid`, `setuid` (real, effective and saved), then checks
-   that `setuid(0)` fails, sets `umask 077`, and `execvpe`s the component.
+1. checks the marker and that `euid == 0`;
+2. refreshes the mirrors and prepares the component's part of the service area (§2.2): private dir, API key and
+   `room.json` copies for agents, the production lock for translator and gate, the module dir for the translator;
+3. rewrites argv: `[<checkout python>, "-m", <module>, …]` becomes `[SERVICE_HOME/venv/bin/python, "-m", <module>, …]`
+   with cwd `SERVICE_HOME/app`. Any other argv shape is refused, and so is a module other than the component's own;
+4. builds the environment from **that component's** schema, not from a prefix wildcard:
+   * every component gets `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `PYTHONUNBUFFERED`, `STRANGLER_LOG_LEVEL`;
+   * agents get `STRANGLER_AGENT_PACE`, `LEGACY_URL`, `MODERN_URL`, `PROXY_URL`, and `SWITCH_URL` (from the
+     environment, else read from the checkout's `switch.env` as root, else the default);
+   * the translator also gets `STRANGLER_TRANSLATOR_MODE`, `STRANGLER_LLM_CMD`, and the variables named in
+     `STRANGLER_TRANSLATOR_PASS_ENV` (comma-separated, for LLM credentials);
+   * the proxy gets `LEGACY_URL` and `MODERN_URL`;
+   * the modern server gets `MODERN_NO_RELOAD`;
+   * set last by the launcher, overriding anything above: `STRANGLER_STATE_DIR=SERVICE_HOME/state`,
+     `PYTHONPATH=SERVICE_HOME/app`, `PYTHONDONTWRITEBYTECODE=1`, `HOME` (its private dir), `USER`/`LOGNAME`,
+     `MODERN_LISTS_PATH=SERVICE_HOME/state/module/lists.py` (translator, modern), and `ROUTER_ADMIN_TOKEN`
+     (proxy and cutover-gate only), whose value is `resolve_router_token()` evaluated as root, the rule both use
+     unisolated;
+   * finally removed from every other component: `ROUTER_ADMIN_TOKEN`, `ROUTER_TOKEN_FILE`. A pass-through name
+     can never set a launcher-set or forbidden variable;
+5. starts a new session (`setsid`; failure is an error), closes every inherited descriptor except 0, 1 and 2, sets
+   the supplementary groups, gid and uid (real, effective and saved), checks that `setuid(0)` now fails, sets
+   `umask 077`, and `execve`s the component. The recorded pid is therefore the component itself.
 
-## 5. Host setup and teardown (root, idempotent)
+### Scripts
 
-`python -m agents.isolation setup` (`make isolate`):
+* With isolation on, "already running" means a live tracked pid **whose uid is the component's user**. A
+  component found running as another uid, or a healthy port with no tracked isolated process, is an error naming the
+  fix (`restart` or `stop`), never "already up".
+* `targets.sh start --fresh` with isolation on also runs `python -m agents.isolation reset`. This unlinks
+  `proxy/router.json`, `fuzzer/divergence_registry.json` (and `.staging`) and `module/lists.py` in the service area.
+* `make clean-state` with isolation on also runs `python -m agents.isolation clean`, which empties `SERVICE_HOME/state`.
+* The run directory must be root-owned and not group- or other-writable. The default `.state/run` under the 0700
+  checkout is out of every service's reach.
 
-* creates the groups `stranglerroom` and `sr-prodlock` and the six system users (no login shell, home
-  `/nonexistent`, primary group named after the user) with the memberships above;
-* makes the path to the repository traversable by the service users. For each ancestor that "other" cannot
-  traverse (on this host `/root`, 0700): if its group bits are empty, first remove "other" permissions from every
-  **other** entry in that directory, then `chgrp stranglerroom` and `chmod g+x` (0710). Under a 0700 `/root` those
-  "other" bits are unreachable today, so no existing access changes; afterwards the service users can reach the
-  repository and nothing else in `/root`. An ancestor whose group bits are already in use makes setup refuse;
-* removes group/other access from the repository's secret-holding, runtime-irrelevant directories:
-  `.switch-infra/`, `.native/`, `.hacp/`;
-* records every change (path, previous mode, previous group) in the marker, which it writes last.
+## 5. Host setup and teardown (root)
 
-`python -m agents.isolation disable` (`make isolate-off`) restores every recorded mode and group and removes the
-marker; `--remove-users` also deletes the users and groups.
+`python -m agents.isolation setup [--service-home DIR]` (`make isolate`):
+
+* refuses while any StranglerRoom component is running (stop them first);
+* writes the marker with `"state": "setting-up"` first, then creates the group `sr-prodlock` and the six system
+  users (no login shell, home `/nonexistent`, primary group named after the user, `sr-prodlock` for translator and
+  gate), creates `SERVICE_HOME`, fills the mirrors, and finally marks it `ready`. It is idempotent: re-running it
+  repairs or updates an existing installation;
+* never changes the permissions of `/root`, the checkout or anything outside `SERVICE_HOME`, `/etc/passwd`,
+  `/etc/group` and the marker.
+
+`python -m agents.isolation disable [--purge]` (`make isolate-off`) removes the marker; `--purge` also removes
+`SERVICE_HOME` and the users and group. Both refuse while a component is running.
 
 ## 6. Verification: `python -m agents.isolation verify` (`make isolate-verify`)
 
 Exit status 0 only if every check passes; prints one table.
 
-1. **Configuration:** users, groups, memberships, marker, path access.
-2. **Access matrix:** for each service user, a forked child drops to that user and attempts each operation, so
-   the kernel decides. Expected: read own key ✓, other keys ✗, `switch.env` ✗, `router.token` ✗, `.state/run/*` ✗,
-   `.switch-infra/.env` ✗; write own directory ✓, others' ✗, `.state/` ✗, code (`agents/`) ✗; `production.lock`
-   read-write ✓ for translator and gate only; create in the module directory ✓ translator only; replace `app/main.py`
-   ✗ for everyone; anything else under `/root` ✗.
-3. **Secret exposure scan:** as each service user, read every reachable regular file under the repository,
-   `/root`, `/tmp`, `/var/tmp`, `/dev/shm`, `/etc`, `/home`, `/opt`, `/srv`, `/var/log` and `/var/lib/stranglerroom`
-   (skipping `.venv` and files over 8 MB). Search for every secret value: `switch.env` and Switch `.env`
-   passwords, tokens and keys, the router token, the three API keys, and the Mattermost database password. Any hit
-   fails, except the user's own API key in its own key file.
-4. **Live processes:** each running component's uid matches its user; `ROUTER_ADMIN_TOKEN` is in the environment of
-   the proxy and the gate only; no secret value appears in any process's command line.
+1. **Configuration:** the marker is `ready`; the users, group and memberships exist; `SERVICE_HOME` ownership and
+   modes match §2.2; `/root` and the checkout are not reachable by any service user.
+2. **Access matrix:** for each service user, a forked child drops to that user and attempts each operation, so the
+   kernel decides. Expected:
+   * read: its own API key copy ✓, other key copies ✗, `room.json` ✓ (agents);
+   * read or traverse: the checkout's `switch.env`, `router.token` and `.state/agents/*` ✗, `/root/.env` ✗;
+   * write: its private dir ✓, others' private dirs ✗, `state/` ✗, `app/` ✗, `venv/` ✗;
+   * `production.lock` read-write ✓ for translator and gate only;
+   * create in `module/` ✓ for the translator only.
+3. **Startup smoke:** as each user, the service interpreter imports the component's module. This proves the
+   interpreter, standard library and dependencies are reachable.
+4. **Secret exposure scan:** as each service user, read every reachable regular file under `SERVICE_HOME`, `/tmp`,
+   `/var/tmp`, `/dev/shm`, `/etc`, `/home`, `/opt`, `/srv`, `/var/log`, `/var/lib/stranglerroom` and `/root`
+   (files over 8 MB are skipped). Search for every secret value: `switch.env` and Switch `.env` passwords, tokens and
+   keys, the router token, the three API keys, and the Mattermost database password. Any hit fails, except a user's
+   own API key in its own key copy.
+5. **Live processes** (when running): each component's uid matches its user; each has its own session;
+   `ROUTER_ADMIN_TOKEN` is in the environment of proxy and gate only; no secret value appears in any process's
+   command line.
 
 ## 7. Interfaces (`agents/isolation.py`)
 
 ```python
-SERVICE_GROUP = "stranglerroom"
 LOCK_GROUP = "sr-prodlock"
+DEFAULT_SERVICE_HOME = Path("/srv/stranglerroom")
 
 @dataclass(frozen=True)
 class Component:
     name: str                  # translator | fuzzer | cutover-gate | proxy | legacy | modern
     user: str                  # "sr-" + name
-    groups: tuple[str, ...]    # supplementary groups
-    agent: bool                # owns .state/agents/<name>.json and receives SWITCH_URL
-    router_token: bool         # receives ROUTER_ADMIN_TOKEN
+    module: str                # the one module it may run, e.g. "agents.translator_agent"
+    agent: bool                # API key + room.json copies, SWITCH_URL
+    router_token: bool         # ROUTER_ADMIN_TOKEN
     production_lock: bool      # member of LOCK_GROUP
-    writes_module: bool        # owns its files in the module directory
+    module_writer: bool        # owns SERVICE_HOME/state/module
+    env_keys: tuple[str, ...]  # component-specific pass-through names (section 4)
 
 COMPONENTS: dict[str, Component]
 
-def repo_root() -> Path                      # resolved checkout root
-def state_dir(env=None) -> Path              # STRANGLER_STATE_DIR or <repo>/.state
-def private_dir(component, env=None) -> Path # state_dir()/component.name
-def module_dir(env=None) -> Path             # parent of MODERN_LISTS_PATH or targets/modern_fastapi/app
+def repo_root() -> Path
 def marker_path(env=None) -> Path
-def isolation_on(env=None) -> bool           # mode resolution of section 3 (raises IsolationError on misconfiguration)
-def child_env(component, parent_env, *, router_token=None, switch_url=None) -> dict[str, str]
-def prepare(component, ids, env=None) -> list[str]   # ids: resolved uid/gid numbers; returns the actions taken
+def load_marker(env=None) -> dict | None
+def isolation_on(env=None) -> bool                      # section 3; raises IsolationError on misconfiguration
+def service_paths(service_home: Path) -> ServicePaths   # app, venv, state, agents, module, lock, private(c)
+def child_env(component, parent_env, *, paths, router_token=None, switch_url=None) -> dict[str, str]
+def sync_mirrors(repo: Path, paths) -> list[str]        # actions taken
+def prepare(component, ids, paths, repo_state: Path) -> list[str]
+def reset(paths) -> list[str]
 def drop_privileges(uid: int, gid: int, groups: list[int]) -> None
-def secret_values(env=None) -> dict[str, str]        # label -> value, for verify
+def secret_values(repo_state: Path, repo: Path) -> dict[str, str]  # label -> value, for verify
 ```
