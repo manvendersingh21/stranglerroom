@@ -1161,8 +1161,11 @@ def test_setup_then_disable_on_a_temporary_host(tmp_path, world_tmp, checkout):
            "STRANGLER_STATE_DIR": str(checkout / ".state")}
     seen: list[tuple[list[str], str]] = []
 
-    def fake_run(cmd):  # records the account commands; the marker must already say setting-up
-        seen.append((list(cmd), json.loads(Path(env["STRANGLER_ISOLATION_MARKER"]).read_text())["state"]))
+    def fake_run(cmd):  # records the account commands; during setup the marker must already say setting-up
+        marker_file = Path(env["STRANGLER_ISOLATION_MARKER"])
+        # disable --purge runs userdel/groupdel after removing the marker whenever the host has the real sr-* users
+        # (a host where `make isolate` ran): record those as "absent" instead of failing to read the marker
+        seen.append((list(cmd), json.loads(marker_file.read_text())["state"] if marker_file.exists() else "absent"))
 
     def resolve(comp):
         return ids_for(comp)
