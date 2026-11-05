@@ -1032,7 +1032,7 @@ def test_scan_lists_links_as_root_but_resolves_them_only_as_the_user(world_tmp):
                                                      str(scan / "linked" / "deep" / "backup.json")]
     # a candidate swapped for a FIFO after the listing is never opened for reading
     result = iso.run_as(iso.Ids(NOBODY, NOBODY), iso.search_readable, [(str(scan / "sub"), ["fifo"])], {})
-    assert result == {"read": 0, "hits": [], "truncated": []}
+    assert result == {"read": 0, "bytes": 0, "hits": [], "truncated": []}
     # the caps bound a walk through links; hitting them is reported
     result = iso.run_as(iso.Ids(NOBODY, NOBODY), lambda: iso.search_readable(
         [(str(scan), ["linked"])], {"n": b"needle-0123456789"}, link_max_files=0))
@@ -1053,8 +1053,8 @@ def test_secret_scan_fails_on_a_symlink_alias_and_spares_the_own_key_alias(world
     rows = iso.secret_scan({"fuzzer": ids_for("fuzzer")}, secrets, [scan],
                            own_keys={"fuzzer": str(paths.key("fuzzer"))})
     fails = [r.check for r in rows if r.status == "FAIL"]
-    assert fails == [f"{scan / 'exposed-key'} exposes api-key:cutover-gate",
-                     "2 readable files searched for 3 secret values"], rows
+    assert len(fails) == 2 and fails[0] == f"{scan / 'exposed-key'} exposes api-key:cutover-gate", rows
+    assert fails[1].startswith("2 more readable files"), rows  # (both are symlinks: resolved by the fuzzer's child)
 
 
 @requires_root
@@ -2062,13 +2062,14 @@ def test_secret_scan_fails_on_incomplete_coverage(world_tmp, monkeypatch):
     monkeypatch.setattr(iso, "SCAN_MAX_DEPTH", 2)
     rows = iso.secret_scan({"x": iso.Ids(NOBODY, NOBODY)}, {"n": "needle-0123456789"}, [scan])
     assert any(r.status == "FAIL" and r.check.startswith("incomplete listing") for r in rows)
-    summary = [r for r in rows if "readable files searched" in r.check]
+    summary = [r for r in rows if "besides the world-readable ones" in r.check]
     assert summary[0].status == "FAIL" and "incomplete" in summary[0].actual  # never PASS on incomplete coverage
     monkeypatch.setattr(iso, "SCAN_MAX_DEPTH", 1024)
     monkeypatch.setattr(iso, "SCAN_MAX_TOTAL_BYTES", 4)  # an overall cap reached
     rows = iso.secret_scan({"x": iso.Ids(NOBODY, NOBODY)}, {"n": "needle-0123456789"}, [scan])
     assert any(r.status == "FAIL" and "total read cap" in r.check for r in rows)
-    assert [r.status for r in rows if "readable files searched" in r.check] == ["FAIL"]
+    assert [r.status for r in rows if "besides the world-readable ones" in r.check] == ["FAIL"]
+    assert [r.status for r in rows if r.check.startswith("world-readable:")] == ["FAIL"]
 
 
 @requires_root
@@ -2294,3 +2295,72 @@ def test_clean_as_non_root_leaves_the_service_area_alone(tmp_path, world_tmp, ch
     out = capsys.readouterr().out
     assert "not root: leaving the service area alone (run make clean-state as root to empty it)" in out
     assert sorted(str(p) for p in paths.state.rglob("*")) == before
+
+
+@requires_root
+def test_split_world_readable(world_tmp):
+    """Only a regular file with o+r under directories that all have o+x is world-readable."""
+    base = world_tmp / "w"
+    (base / "open").mkdir(parents=True)
+    (base / "closed").mkdir()
+    (base / "closed").chmod(0o750)
+    for name, mode in (("open/public.txt", 0o644), ("open/group.txt", 0o640), ("closed/inside.txt", 0o644)):
+        (base / name).write_text("x")
+        (base / name).chmod(mode)
+    (base / "open" / "alias").symlink_to(base / "open" / "public.txt")
+    world, rest = iso.split_world_readable(iso.scan_candidates([base]))
+
+    def as_set(part):
+        return {os.path.join(d, f) for d, files in part for f in files}
+
+    assert as_set(world) == {str(base / "open" / "public.txt")}
+    assert as_set(rest) == {str(base / "open" / "group.txt"), str(base / "closed" / "inside.txt"),
+                            str(base / "open" / "alias")}
+
+
+@requires_root
+def test_world_readable_content_is_searched_once_and_counts_for_every_subject(world_tmp):
+    scan = world_tmp / "scan"
+    scan.mkdir()
+    (scan / "public.log").write_text("leak needle-0123456789 leak")
+    (scan / "public.log").chmod(0o644)
+    (scan / "mine.log").write_text("needle-0123456789")
+    os.chown(scan / "mine.log", UIDS["proxy"], UIDS["proxy"])
+    (scan / "mine.log").chmod(0o600)  # readable by the proxy's user alone, through its owner bits
+    subjects = {"proxy": ids_for("proxy"), "legacy": ids_for("legacy"), "modern": ids_for("modern")}
+    rows = iso.secret_scan(subjects, {"n": "needle-0123456789"}, [scan])
+    shared = [r for r in rows if r.check.startswith("world-readable:")]
+    assert len(shared) == 1 and shared[0].status == "PASS"
+    assert shared[0].check.startswith("world-readable: 1 files, 27 bytes searched once (as proxy)")
+    public, mine = str(scan / "public.log"), str(scan / "mine.log")
+    for subject in subjects:  # the one shared search's hit is reported for every subject
+        assert any(r.subject == subject and r.check == f"{public} exposes n" and r.status == "FAIL" for r in rows)
+    # each subject's own pass read only what is not world-readable: the public file was read exactly once
+    own = {r.subject: r.check.split(" more readable files")[0] for r in rows if "besides the world" in r.check}
+    assert own == {"proxy": "1", "legacy": "0", "modern": "0"}
+    assert [r.subject for r in rows if r.check == f"{mine} exposes n"] == ["proxy"]
+
+
+@requires_root
+def test_the_read_budget_is_global_for_the_run(world_tmp, monkeypatch):
+    scan = world_tmp / "scan"
+    scan.mkdir()
+    for i in range(3):
+        (scan / f"f{i}.log").write_text("x" * 100)
+        (scan / f"f{i}.log").chmod(0o644)
+    subjects = {"proxy": ids_for("proxy"), "legacy": ids_for("legacy")}
+    monkeypatch.setattr(iso, "SCAN_MAX_FILES", 2)  # the shared pass alone needs 3
+    rows = iso.secret_scan(subjects, {"n": "needle-0123456789"}, [scan])
+    assert any(r.status == "FAIL" and "file cap of 2 reached" in r.check for r in rows)
+    assert [r.status for r in rows if "besides the world-readable ones" in r.check] == ["FAIL", "FAIL"]
+    monkeypatch.setattr(iso, "SCAN_MAX_FILES", 1000)
+    monkeypatch.setattr(iso, "SCAN_MAX_TOTAL_BYTES", 300)  # exactly the shared content: nothing left after it
+    (scan / "own.log").write_text("y" * 10)
+    os.chown(scan / "own.log", UIDS["legacy"], UIDS["legacy"])
+    (scan / "own.log").chmod(0o600)
+    rows = iso.secret_scan(subjects, {"n": "needle-0123456789"}, [scan])
+    assert [r.status for r in rows if r.check.startswith("world-readable:")] == ["PASS"]
+    legacy = [r for r in rows if r.subject == "legacy"]
+    assert any(r.status == "FAIL" and "total read cap" in r.check for r in legacy), legacy
+    assert all(r.status != "PASS" for r in legacy if "besides the world" in r.check)
+    assert iso.SCAN_MAX_TOTAL_BYTES == 300  # (monkeypatched; the real budget is 32 GiB and 2M files per run)

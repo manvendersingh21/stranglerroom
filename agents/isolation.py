@@ -2133,9 +2133,10 @@ def smoke(component: Component | str, ids: Ids, paths: ServicePaths, *, timeout:
 
 
 SCAN_MAX_DEPTH = 1024
-#: per subject: the scan reads at most this much in all; reaching a cap fails verification (coverage incomplete)
-SCAN_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
-SCAN_MAX_FILES = 1_000_000
+#: one budget for the whole verify run (the world-readable pass and every subject's own pass together); reaching
+#: it fails verification with an "incomplete" row. Sized for hosts that hold large world-readable archives.
+SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024 * 1024
+SCAN_MAX_FILES = 2_000_000
 SCAN_CHUNK = 1024 * 1024
 
 
@@ -2211,14 +2212,19 @@ LINK_WALK_MAX_BYTES = 512 * 1024 * 1024
 def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Mapping[str, bytes], *,
                     own_key: str | None = None, link_max_files: int | None = None,
                     link_max_bytes: int | None = None, max_total_bytes: int | None = None,
-                    max_files: int | None = None, chunk: int | None = None) -> dict[str, Any]:
+                    max_files: int | None = None, chunk: int | None = None,
+                    seed_dirs: Iterable[str] | None = None) -> dict[str, Any]:
     """As the current (dropped) user: read every candidate it can (the kernel decides) and search it for every
     secret value. Each candidate is opened ``O_PATH`` (following a symlink as this user only; no side effects even
     on a device node), checked with fstat to be a regular file, and only then reopened for reading through that
-    descriptor. Files of any size are searched in streamed chunks that overlap by the longest secret's length. A
-    candidate that leads to a directory (a directory symlink) is walked here, as this user, with a (st_dev, st_ino)
-    visited set and the ``link_max_*`` caps. Reaching any cap is reported in ``truncated`` (verify fails). Returns
-    the number of files read, [path, [labels], is-own-key-copy] for each hit (never a value) and ``truncated``."""
+    descriptor. Files of any size are searched in streamed chunks that overlap by the longest secret's length (each
+    chunk with one C-level ``bytes`` search per distinct value: measured faster here than a combined regular
+    expression or a prefix prefilter). A candidate that leads to a directory (a directory symlink) is walked here,
+    as this user, with a (st_dev, st_ino) visited set (seeded with ``seed_dirs``, default the candidates'
+    directories: what the listing already covers is not walked again) and the ``link_max_*`` caps. ``max_*``: this
+    pass's share of the run's budget. Reaching any cap is reported in ``truncated`` (verify fails). Returns the
+    number of files and bytes read, [path, [labels], is-own-key-copy] for each hit (never a value) and
+    ``truncated``."""
     link_max_files = LINK_WALK_MAX_FILES if link_max_files is None else link_max_files
     link_max_bytes = LINK_WALK_MAX_BYTES if link_max_bytes is None else link_max_bytes
     max_total_bytes = SCAN_MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
@@ -2237,7 +2243,7 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
         except OSError:
             pass
     visited: set[tuple[int, int]] = set()
-    for dirpath, _files in candidates:  # directories the listing covers are not walked again through links
+    for dirpath in (seed_dirs if seed_dirs is not None else (d for d, _files in candidates)):
         try:
             dst = os.stat(dirpath)
             visited.add((dst.st_dev, dst.st_ino))
@@ -2253,7 +2259,7 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
         found: set[str] = set()
         tail = b""
         while True:
-            if state["bytes"] >= max_total_bytes:
+            if state["bytes"] > max_total_bytes:  # the file grew past what read_one budgeted for it
                 truncate(f"total read cap of {max_total_bytes} bytes reached")
                 return found
             try:
@@ -2272,6 +2278,9 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
     def read_one(path: str, pfd: int, st: os.stat_result, via_link_walk: bool) -> None:
         if state["read"] >= max_files:
             truncate(f"file cap of {max_files} reached")
+            return
+        if state["bytes"] + st.st_size > max_total_bytes:
+            truncate(f"total read cap of {max_total_bytes} bytes reached")
             return
         if via_link_walk:
             if state["link_files"] >= link_max_files or state["link_bytes"] + st.st_size > link_max_bytes:
@@ -2328,15 +2337,19 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
             continue
         for name in files:
             visit(os.path.join(dirpath, name), None)
-    return {"read": state["read"], "hits": state["hits"], "truncated": state["truncated"]}
+    return {"read": state["read"], "bytes": state["bytes"], "hits": state["hits"], "truncated": state["truncated"]}
 
 
 def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: Iterable[str | Path], *,
                 own_keys: Mapping[str, str] | None = None) -> list[Row]:
-    """§6.4: as each subject, a forked child reads every candidate it can (the kernel decides), following symlinks
-    only as that user, and searches it for every secret value. A hit fails unless it is the subject's own API key
-    in its own key copy (``own_keys``: subject -> path; matched by inode, so an alias of the copy is no hit).
-    Incomplete coverage (a directory too deep to list, a cap reached) fails, and the summary never passes then."""
+    """§6.4: every file a service user can read is searched for every secret value, the kernel deciding what is
+    readable. World-readable content (a regular file with o+r under directories that all have o+x, which every
+    service user can read) is searched once per run, by the first subject's forked child, and its hits count for
+    every subject. Each subject's own child then reads the remaining candidates it can (through owner or group bits,
+    or through a symlink it follows as that user). A hit fails unless it is the subject's own API key in its own key
+    copy (``own_keys``: subject -> path; matched by inode). One read budget (SCAN_MAX_TOTAL_BYTES / SCAN_MAX_FILES)
+    covers the whole run; incomplete coverage (a directory too deep to list, a cap reached) fails, and no summary
+    passes then."""
     rows: list[Row] = []
     usable = {k: v.encode() for k, v in secrets.items() if len(v) >= MIN_SECRET_LEN}
     for label in sorted(set(secrets) - set(usable)):
@@ -2349,10 +2362,33 @@ def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: 
     if len(problems) > 20:
         rows.append(Row("secrets", "-", f"... {len(problems) - 20} more incomplete listings", "complete",
                         "incomplete", "FAIL"))
+    if not subjects:
+        return rows
+    world, rest = split_world_readable(candidates)
+    seed = [d for d, _files in candidates]
+    budget = {"bytes": SCAN_MAX_TOTAL_BYTES, "files": SCAN_MAX_FILES}
+
+    def search(ids: Ids, part: list[tuple[str, list[str]]], own_key: str | None) -> dict[str, Any]:
+        result = run_as(ids, lambda: search_readable(part, usable, own_key=own_key, seed_dirs=seed,
+                                                     max_total_bytes=max(budget["bytes"], 0),
+                                                     max_files=max(budget["files"], 0)), timeout=3600.0)
+        budget["bytes"] -= result["bytes"]
+        budget["files"] -= result["read"]
+        return result
+
+    first = next(iter(subjects))
+    shared = search(subjects[first], world, None)
+    shared_hits = [(path, labels) for path, labels, _own in shared["hits"]]
+    rows.append(Row("secrets", "-", f"world-readable: {shared['read']} files, {shared['bytes']} bytes searched once "
+                    f"(as {first}); their hits count for every subject", "complete",
+                    "complete" if not shared["truncated"] else "incomplete",
+                    "PASS" if not shared["truncated"] else "FAIL"))
+    for why in shared["truncated"]:
+        rows.append(Row("secrets", "-", f"scan incomplete (world-readable pass): {why}", "complete", "cut short",
+                        "FAIL"))
     for subject, ids in subjects.items():
-        own_key = (own_keys or {}).get(subject)
-        result = run_as(ids, lambda key=own_key: search_readable(candidates, usable, own_key=key), timeout=1800.0)
-        bad = []
+        result = search(ids, rest, (own_keys or {}).get(subject))
+        bad = [(path, labels) for path, labels in shared_hits]
         for path, labels, own in result["hits"]:
             labels = [lb for lb in labels if not (own and lb == f"api-key:{subject}")]
             if labels:
@@ -2362,11 +2398,59 @@ def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: 
                             "FAIL"))
         for why in result["truncated"]:
             rows.append(Row("secrets", subject, f"scan incomplete: {why}", "complete", "cut short", "FAIL"))
-        complete = not result["truncated"] and not problems
-        rows.append(Row("secrets", subject, f"{result['read']} readable files searched for {len(usable)} secret "
-                        "values", "0 hits, complete", f"{len(bad)} hits" + ("" if complete else ", incomplete"),
+        complete = not result["truncated"] and not shared["truncated"] and not problems
+        rows.append(Row("secrets", subject, f"{result['read']} more readable files ({result['bytes']} bytes) besides "
+                        f"the world-readable ones, searched for {len(usable)} secret values", "0 hits, complete",
+                        f"{len(bad)} hits" + ("" if complete else ", incomplete"),
                         "PASS" if not bad and complete else "FAIL"))
     return rows
+
+
+def split_world_readable(candidates: Sequence[tuple[str, Sequence[str]]]) -> tuple[list[tuple[str, list[str]]],
+                                                                                  list[tuple[str, list[str]]]]:
+    """(world, rest): ``world`` holds the regular files with o+r whose every ancestor directory has o+x (lstat as
+    root; any service user can read them), ``rest`` everything else (symlinks included, resolved only by the dropped
+    children). Conservative: a named-user ACL or an owner-class denial may make a "world" file unreadable for one
+    user, which can only add a hit, never hide one."""
+    traversable: dict[str, bool] = {}
+
+    def chain_ok(path: str) -> bool:
+        pending = []
+        current = path
+        while current not in traversable:
+            pending.append(current)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        for directory in reversed(pending):
+            parent = os.path.dirname(directory)
+            try:
+                st = os.lstat(directory)
+                own = stat.S_ISDIR(st.st_mode) and bool(st.st_mode & 0o001)
+            except OSError:
+                own = False
+            traversable[directory] = own and (parent == directory or traversable.get(parent, False))
+        return traversable[path]
+
+    world: list[tuple[str, list[str]]] = []
+    rest: list[tuple[str, list[str]]] = []
+    for dirpath, files in candidates:
+        shared, own = [], []
+        reachable = chain_ok(dirpath)
+        for name in files:
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if reachable and stat.S_ISREG(st.st_mode) and st.st_mode & 0o004:
+                shared.append(name)
+            else:
+                own.append(name)
+        if shared:
+            world.append((dirpath, shared))
+        rest.append((dirpath, own))
+    return world, rest
 
 
 def _secret_keys(entries: Mapping[str, str], source: str) -> dict[str, str]:
