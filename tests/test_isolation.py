@@ -130,7 +130,7 @@ def make_checkout(base: Path) -> Path:
     (state / "switch.env").write_text("SWITCH_URL=http://from-switch-env:1\n"
                                       + "".join(f"{k}={v}\n" for k, v in SWITCH_SECRETS.items()))
     (state / "switch.env").chmod(0o600)
-    (state / "connection.env").write_text("SWITCH_URL=http://switch.example:18000\n")
+    (state / "connection.env").write_text("SWITCH_URL=http://10.0.0.5:18000\n")
     (state / "router.token").write_text(ROUTER_TOKEN + "\n")
     (state / "router.token").chmod(0o600)
     (state / "room.json").write_text('{"room_id": "r-1"}')
@@ -251,6 +251,32 @@ def test_an_untrusted_marker_is_refused(tmp_path):
         iso.isolation_on(env)
 
 
+@requires_root
+@pytest.mark.parametrize("mode", ["auto", "on"])
+def test_a_marker_under_a_service_controlled_ancestor_is_an_error_never_off(tmp_path, mode):
+    """codex isolation-impl #1: a service owning any ancestor could rename the marker's directory away and turn
+    `auto` into off. The whole chain is checked, also when the marker is (now) missing."""
+    control = tmp_path / "control"
+    (control / "markers").mkdir(parents=True)
+    marker = control / "markers" / "isolation.json"
+    marker.write_text(json.dumps({"state": "ready", "repo": str(ROOT), "service_home": "/srv/x"}))
+    os.chown(control, NOBODY, NOBODY)  # the compromised service's directory; markers/ stays root's
+    env = {"STRANGLER_ISOLATION": mode, "STRANGLER_ISOLATION_MARKER": str(marker)}
+    with pytest.raises(iso.IsolationError, match="owned by uid 65534"):
+        iso.isolation_on(env)
+    (control / "markers").rename(control / "moved")  # what the service would do
+    with pytest.raises(iso.IsolationError, match="owned by uid 65534"):
+        iso.isolation_on(env)
+    with pytest.raises(iso.IsolationError, match="owned by uid 65534"):
+        iso.write_marker({"state": "ready"}, env)
+    assert not (control / "markers").exists()
+    # a group/other-writable (non-sticky) ancestor is refused the same way
+    os.chown(control, 0, 0)
+    control.chmod(0o777)
+    with pytest.raises(iso.IsolationError, match="group/other-writable"):
+        iso.isolation_on(env)
+
+
 def test_bad_mode_value_fails(tmp_path):
     with pytest.raises(iso.IsolationError, match="off, on or auto"):
         iso.isolation_on({"STRANGLER_ISOLATION": "yes"})
@@ -311,6 +337,27 @@ def test_run_dir_on_an_untrusted_path_is_refused(tmp_path):
 
 
 @requires_root
+def test_run_dir_creation_never_follows_an_unchecked_ancestor(tmp_path):
+    """codex isolation-impl #2: missing components are created descriptor by descriptor, each checked before the
+    next is created, so a service-owned ancestor holding `slot -> /etc` gets no root mkdir through it."""
+    target = tmp_path / "etc-like"
+    target.mkdir()
+    sr_run = tmp_path / "sr-run"
+    sr_run.mkdir()
+    (sr_run / "slot").symlink_to(target)
+    os.chown(sr_run, NOBODY, NOBODY)  # planted by a service after an earlier check would have seen nothing
+    with pytest.raises(iso.IsolationError, match="owned by uid 65534"):
+        iso.ensure_run_dir(sr_run / "slot" / "run")
+    assert list(target.iterdir()) == []
+    os.chown(sr_run, 0, 0)  # root's directory, but the next component is a symlink: refused, not followed
+    with pytest.raises(iso.IsolationError, match="symlink"):
+        iso.ensure_run_dir(sr_run / "slot" / "run")
+    assert list(target.iterdir()) == []
+    created = iso.ensure_run_dir(tmp_path / "fresh" / "a" / "run")
+    assert created and st(tmp_path / "fresh" / "a" / "run") == (0o700, 0, 0) and st(tmp_path / "fresh")[0] == 0o700
+
+
+@requires_root
 def test_run_dir_holding_more_than_launcher_files_is_not_locked_down(tmp_path):
     logs = tmp_path / "var-log"
     logs.mkdir(mode=0o755)
@@ -349,7 +396,8 @@ PARENT_ENV = {
     "LD_PRELOAD": "/root/evil.so", "STRANGLER_PRODUCTION_LOCK": "/root/lock", "SWITCH_URL": "http://env-switch:1",
 }
 COMMON = {"PATH", "LANG", "LC_ALL", "TZ", "PYTHONUNBUFFERED", "STRANGLER_LOG_LEVEL"}
-LAUNCHER = {"STRANGLER_STATE_DIR", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "HOME", "USER", "LOGNAME"}
+LAUNCHER = {"STRANGLER_STATE_DIR", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTHONSAFEPATH", "HOME", "USER",
+            "LOGNAME"}
 EXPECTED_KEYS = {
     "translator": COMMON | LAUNCHER | {"STRANGLER_AGENT_PACE", "LEGACY_URL", "MODERN_URL", "PROXY_URL", "SWITCH_URL",
                                        "STRANGLER_TRANSLATOR_MODE", "STRANGLER_LLM_CMD", "ANTHROPIC_API_KEY",
@@ -367,7 +415,7 @@ EXPECTED_KEYS = {
 def test_child_env_follows_the_component_schema(name):
     comp = iso.COMPONENTS[name]
     paths = iso.service_paths("/srv/sr")
-    env = iso.child_env(comp, PARENT_ENV, paths=paths, router_token="  the-token\n", switch_url="http://sw:18000")
+    env = iso.child_env(comp, PARENT_ENV, paths=paths, router_token="  the-token\n", switch_url="http://10.1.2.3:18000")
     assert set(env) == EXPECTED_KEYS[name]
     assert env["HOME"] == f"/srv/sr/state/{name}" and env["USER"] == env["LOGNAME"] == comp.user
     assert env["STRANGLER_STATE_DIR"] == "/srv/sr/state" and env["PYTHONPATH"] == "/srv/sr/app"
@@ -377,7 +425,7 @@ def test_child_env_follows_the_component_schema(name):
         assert env["ROUTER_ADMIN_TOKEN"] == "the-token"  # resolved by the launcher, never root's environment value
     assert ("SWITCH_URL" in env) == comp.agent
     if comp.agent:
-        assert env["SWITCH_URL"] == "http://sw:18000"
+        assert env["SWITCH_URL"] == "http://10.1.2.3:18000"
     if comp.uses_module:
         assert env["MODERN_LISTS_PATH"] == "/srv/sr/state/module/lists.py"
     for secret in ("GATEWAY_ADMIN_PASSWORD", "MATTERMOST_USER_PASSWORD", "GH_TOKEN", "ROUTER_TOKEN_FILE",
@@ -404,7 +452,7 @@ def test_child_env_requires_the_token_and_the_switch_url():
 def test_pass_env_can_never_set_a_launcher_set_or_forbidden_variable(name):
     env = {**PARENT_ENV, "STRANGLER_TRANSLATOR_PASS_ENV": f"ANTHROPIC_API_KEY,{name}"}
     with pytest.raises(iso.IsolationError, match="may not forward"):
-        iso.child_env("translator", env, paths=iso.service_paths("/srv/sr"), switch_url="http://sw")
+        iso.child_env("translator", env, paths=iso.service_paths("/srv/sr"), switch_url="http://10.1.2.3:1")
 
 
 def test_switch_url_from_env_then_connection_env_never_switch_env(tmp_path):
@@ -505,6 +553,38 @@ def test_sync_mirrors_refuses_a_symlink_a_service_could_steer(world_tmp, checkou
         (site / "escape.py").symlink_to("../../../../outside.py")
     with pytest.raises(iso.IsolationError, match="refusing to mirror"):
         iso.sync_mirrors(checkout, paths)
+
+
+@requires_root
+def test_absolute_link_through_mutable_indirection_is_refused_by_sync_and_verify(world_tmp, checkout):
+    """codex isolation-impl #3: `gate.py -> /x/linkbox/gate.py`, where the service owns linkbox and gate.py is a
+    symlink to a genuine root module. realpath looks trustworthy, but the service can swap gate.py later."""
+    paths = iso.service_paths(world_tmp / "srv")
+    iso.ensure_service_home(paths)
+    linkbox = world_tmp / "linkbox"
+    linkbox.mkdir()
+    (linkbox / "gate.py").symlink_to(BASE_PYTHON)  # currently resolves to a root-owned file
+    os.chown(linkbox, NOBODY, NOBODY)
+    site = checkout / ".venv/lib/python3.12/site-packages"
+    (site / "gate.py").symlink_to(linkbox / "gate.py")
+    with pytest.raises(iso.IsolationError, match="refusing to mirror"):
+        iso.sync_mirrors(checkout, paths)
+    # the same rule in verify: a mirror link whose chain a service could change is reported
+    (site / "gate.py").unlink()
+    iso.sync_mirrors(checkout, paths)
+    assert iso._not_root_only(paths.venv) == []
+    os.symlink(linkbox / "gate.py", paths.venv / "lib/python3.12/site-packages/gate.py")
+    bad = iso._not_root_only(paths.venv)
+    assert len(bad) == 1 and "gate.py" in bad[0] and "65534" in bad[0]
+    # and the checks themselves: root-only chains pass, a link owned by a service or a missing entry in a
+    # world-writable directory does not
+    assert iso.check_link_target(BASE_PYTHON, Path("/")) == Path(BASE_PYTHON)
+    assert iso.check_link_target("python", paths.venv / "bin") == Path(BASE_PYTHON)
+    with pytest.raises(iso.IsolationError, match="missing in /tmp"):
+        iso.check_link_target("/tmp/sr-iso-not-there/x.py", Path("/"))
+    with pytest.raises(iso.IsolationError, match="more than"):
+        (world_tmp / "loop").symlink_to(world_tmp / "loop")
+        iso.check_link_target(str(world_tmp / "loop"), Path("/"))
 
 
 @requires_root
@@ -798,7 +878,7 @@ def test_launch_gives_the_translator_its_pass_env_key_and_module(world_tmp, chec
     assert "error" not in report, report
     env = report["env"]
     assert env["LLM_API_KEY"] == "llm-secret" and "ROUTER_ADMIN_TOKEN" not in env
-    assert env["SWITCH_URL"] == "http://switch.example:18000"  # connection.env, never switch.env
+    assert env["SWITCH_URL"] == "http://10.0.0.5:18000"  # connection.env, never switch.env
     assert env["MODERN_LISTS_PATH"] == str(paths.module_file)
     assert report["groups"] == [LOCK_GID]
     assert report["reach"] == {str(paths.key("translator")): True}
@@ -840,7 +920,13 @@ def test_exec_with_isolation_on_but_no_users_exits_2_without_running(tmp_path):
         pytest.skip("the service users exist on this host")
     marker = write_marker(tmp_path, service_home=str(tmp_path / "srv"))
     flag = tmp_path / "ran"
-    r = _cli("exec", "proxy", "--", "python", "-m", "targets.proxy.router",
+    command = ["sh", "-c", f"touch {shlex.quote(str(flag))}"]
+    # control: the very same command line does run (and write the flag) when isolation is off ...
+    assert _cli("exec", "proxy", "--", *command, env={"STRANGLER_ISOLATION": "off"}).returncode == 0
+    assert flag.exists()
+    flag.unlink()
+    # ... and with isolation on, without the service users, it is refused before anything runs or is created
+    r = _cli("exec", "proxy", "--", *command,
              env={**marker, "STRANGLER_ISOLATION": "on", "STRANGLER_STATE_DIR": str(tmp_path / "state")})
     assert r.returncode == 2 and "sr-proxy does not exist" in r.stderr, r.stderr
     assert not flag.exists() and not (tmp_path / "srv").exists() and not (tmp_path / "state").exists()
@@ -918,23 +1004,53 @@ def test_secret_scan_finds_readable_secrets_except_the_own_key(world_tmp, checko
 
 
 @requires_root
-def test_scan_never_follows_links_nor_opens_special_files(world_tmp):
+def test_scan_lists_links_as_root_but_resolves_them_only_as_the_user(world_tmp):
     scan = world_tmp / "scan"
     (scan / "sub").mkdir(parents=True)
-    secret_dir = world_tmp / "elsewhere"
-    secret_dir.mkdir()
-    (secret_dir / "s.txt").write_text("needle-0123456789")
-    (scan / "linked").symlink_to(secret_dir)       # root's listing must not walk into it
-    (scan / "file-link").symlink_to(secret_dir / "s.txt")
-    os.mkfifo(scan / "sub" / "fifo")               # opening it for reading would block
+    outside = world_tmp / "elsewhere"  # outside the scan roots
+    (outside / "deep").mkdir(parents=True)
+    (outside / "deep" / "backup.json").write_text("key needle-0123456789")
+    (outside / "private.txt").write_text("needle-0123456789")
+    (outside / "private.txt").chmod(0o600)
+    (outside / "deep" / "loop").symlink_to(outside)  # a cycle: walked once
+    (scan / "linked").symlink_to(outside)            # a readable directory alias
+    (scan / "file-link").symlink_to(outside / "deep" / "backup.json")
+    (scan / "private-link").symlink_to(outside / "private.txt")
+    os.mkfifo(scan / "sub" / "fifo")                 # opening it for reading would block
     candidates = iso.scan_candidates([scan])
     listed = {os.path.join(d, f) for d, files in candidates for f in files}
-    assert listed == set() and all(not d.startswith(str(scan / "linked")) for d, _ in candidates)
-    # a candidate swapped for a FIFO or a link after the listing is neither opened for reading nor followed
-    swapped = [(str(scan / "sub"), ["fifo"]), (str(scan), ["file-link"])]
+    assert listed == {str(scan / "linked"), str(scan / "file-link"), str(scan / "private-link")}
+    assert all(not d.startswith(str(scan / "linked")) for d, _ in candidates)  # root never walked the alias
     started = time.monotonic()
-    result = iso.run_as(iso.Ids(NOBODY, NOBODY), iso.search_readable, swapped, {"n": b"needle-0123456789"})
-    assert result == {"read": 0, "hits": []} and time.monotonic() - started < 10
+    result = iso.run_as(iso.Ids(NOBODY, NOBODY), iso.search_readable, candidates, {"n": b"needle-0123456789"})
+    assert time.monotonic() - started < 10 and result["truncated"] is False
+    assert sorted(h[0] for h in result["hits"]) == [str(scan / "file-link"),
+                                                     str(scan / "linked" / "deep" / "backup.json")]
+    # a candidate swapped for a FIFO after the listing is never opened for reading
+    result = iso.run_as(iso.Ids(NOBODY, NOBODY), iso.search_readable, [(str(scan / "sub"), ["fifo"])], {})
+    assert result == {"read": 0, "hits": [], "truncated": False}
+    # the caps bound a walk through links; hitting them is reported
+    result = iso.run_as(iso.Ids(NOBODY, NOBODY), lambda: iso.search_readable(
+        [(str(scan), ["linked"])], {"n": b"needle-0123456789"}, link_max_files=0))
+    assert result["truncated"] is True
+
+
+@requires_root
+def test_secret_scan_fails_on_a_symlink_alias_and_spares_the_own_key_alias(world_tmp, checkout, area):
+    paths = area
+    archive = world_tmp / "archive"
+    archive.mkdir()
+    (archive / "key.json").write_text(json.dumps({"api_key": AGENT_KEYS["cutover-gate"]}))
+    scan = world_tmp / "scan"
+    scan.mkdir()
+    (scan / "exposed-key").symlink_to(archive / "key.json")
+    (scan / "my-key").symlink_to(paths.key("fuzzer"))  # the fuzzer's own copy, reached through an alias
+    secrets = {f"api-key:{n}": k for n, k in AGENT_KEYS.items()}
+    rows = iso.secret_scan({"fuzzer": ids_for("fuzzer")}, secrets, [scan],
+                           own_keys={"fuzzer": str(paths.key("fuzzer"))})
+    fails = [r.check for r in rows if r.status == "FAIL"]
+    assert fails == [f"{scan / 'exposed-key'} exposes api-key:cutover-gate",
+                     "2 readable files searched for 3 secret values"], rows
 
 
 @requires_root
@@ -974,18 +1090,45 @@ def test_process_checks_on_a_live_isolated_component(world_tmp, checkout):
     pid = report["_pid"]
     try:
         assert "error" not in report, report
+        assert pid in iso.component_instances().get("proxy", [])  # found without any pid file
+        # (this host may run its own proxy too: the inventory is passed explicitly to keep the test deterministic)
         rows = iso.process_checks({"proxy": ids_for("proxy"), "legacy": ids_for("legacy")},
-                                  {"router.token": ROUTER_TOKEN}, {"proxy": pid})
+                                  {"router.token": ROUTER_TOKEN}, {"proxy": pid}, instances={"proxy": [pid]})
         by_check = {r.check: r.status for r in rows if r.subject == "proxy"}
         assert all(s == "PASS" for s in by_check.values()), rows
         assert any("own session" in c for c in by_check) and any("ROUTER_ADMIN_TOKEN" in c for c in by_check)
+        assert any("tracked instance" in c for c in by_check)
         assert [r.status for r in rows if r.subject == "legacy"] == ["SKIP"]
         # the same process judged as if it were the legacy server: it must not hold the token
-        rows = iso.process_checks({"legacy": ids_for("proxy")}, {"router.token": ROUTER_TOKEN}, {})
+        rows = iso.process_checks({"legacy": ids_for("proxy")}, {"router.token": ROUTER_TOKEN}, {}, instances={})
         assert any(r.status == "FAIL" and "ROUTER_ADMIN_TOKEN" in r.check for r in rows)
     finally:
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
+
+
+def test_process_checks_fail_on_untracked_root_and_duplicate_instances():
+    procs = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "-m",
+                               "targets.legacy_openlibrary.server"]) for _ in range(2)]
+    try:
+        time.sleep(0.3)
+        found = iso.component_instances().get("legacy", [])
+        assert {p.pid for p in procs} <= set(found)  # no pid file needed to find them
+        ids = ids_for("legacy")
+        one = procs[0].pid
+        rows = iso.process_checks({"legacy": ids}, {}, {}, instances={"legacy": [one]})  # untracked, runs as root
+        bad = {r.check for r in rows if r.status == "FAIL"}
+        assert f"pid {one} is the tracked instance (pid file: None)" in bad
+        assert f"pid {one} runs as uid {ids.uid} (real/effective/saved/fs)" in bad
+        assert all(r.status != "SKIP" for r in rows)
+        rows = iso.process_checks({"legacy": ids}, {}, {"legacy": one},
+                                  instances={"legacy": [p.pid for p in procs]})  # tracked, plus a duplicate
+        assert any(r.status == "FAIL" and r.check.startswith("exactly one instance") for r in rows)
+        assert any(r.status == "FAIL" and r.check.startswith(f"pid {procs[1].pid} is the tracked") for r in rows)
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
 
 
 # ------------------------------------------------------------------------------------- §5 setup / disable
@@ -1124,7 +1267,8 @@ def test_scripts_launch_through_the_isolation_prefix_and_decide_the_mode_first()
         assert mode_at < text.index('mkdir -p "$RUN"') and mode_at < text.index('exec 9>"$RUN/')
         assert 'ISOLATE=""' in text and "on) ISOLATE=1 ;;" in text
     assert 'RUN="$STATE/run"' in targets and 'RUN="${STRANGLER_RUN_DIR:-$STATE/run}"' in agents
-    assert 'STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"' in targets and 'STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"' in agents
+    state_line = 'STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"'
+    assert state_line in targets and state_line in agents
     fresh = targets[targets.index('if [ "${2:-}" = "--fresh" ]'):targets.index('echo "starting targets"')]
     for part in ('"${MODERN_LISTS_PATH:-$ROOT/targets/modern_fastapi/app/lists.py}"',
                  '"${ROUTER_STATE_FILE:-$STATE/proxy/router.json}"', '"$STATE/fuzzer/divergence_registry.json"',
@@ -1154,11 +1298,34 @@ def fake_module(tmp_path):
     _kill_marked(str(tmp_path))
 
 
-def _svc(tmp: Path, port: int, isolated_pid_rc: int, *pre: str, listener_rc: int = 0) -> subprocess.CompletedProcess:
+FAKE_INTERPRETER = r'''#!/bin/bash
+# Stands in for "$PY": `-m agents.isolation exec <name> -- <argv...>` records how the launcher was invoked (its
+# STRANGLER_ISOLATION and argv) and execs <argv...>, keeping the pid; anything else runs the real interpreter.
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "agents.isolation" ]; then
+  { printf 'STRANGLER_ISOLATION=%s\n' "${STRANGLER_ISOLATION:-}"; printf '%s\n' "$@"; } >>"$LAUNCH_RECORD"
+  shift 4
+  if [ "${1:-}" = "--" ]; then shift; fi
+  exec "$@"
+fi
+exec @PYTHON@ "$@"
+'''
+
+
+def fake_interpreter(directory: Path) -> Path:
+    path = directory / "fake-python"
+    path.write_text(FAKE_INTERPRETER.replace("@PYTHON@", shlex.quote(sys.executable)))
+    path.chmod(0o755)
+    return path
+
+
+def _svc(tmp: Path, port: int, isolated_pid_rc: int, *pre: str, listener_rc: int = 0,
+         py: str | None = None) -> subprocess.CompletedProcess:
     harness = "\n".join([
         "set -euo pipefail",
-        f"ROOT={shlex.quote(str(tmp))}", f"RUN={shlex.quote(str(tmp / 'run'))}", f"PY={shlex.quote(sys.executable)}",
-        f"export PYTHONPATH={shlex.quote(str(ROOT))} STRANGLER_ISOLATION=off SR_ISO_TEST_MARK={shlex.quote(str(tmp))}",
+        f"ROOT={shlex.quote(str(tmp))}", f"RUN={shlex.quote(str(tmp / 'run'))}",
+        f"PY={shlex.quote(py or str(fake_interpreter(tmp)))}",
+        f"export PYTHONPATH={shlex.quote(str(ROOT))} SR_ISO_TEST_MARK={shlex.quote(str(tmp))}",
+        f"export LAUNCH_RECORD={shlex.quote(str(tmp / 'launch.record'))}",
         _function(ROOT / "scripts/targets.sh", "is_target_pid", "svc"),
         # stand-ins for "runs as sr-<name>" and "sr-<name> owns the listener" (no such user here)
         f"isolated_pid() {{ return {isolated_pid_rc}; }}", f"isolated_listener() {{ return {listener_rc}; }}",
@@ -1184,6 +1351,11 @@ def test_svc_isolated_launch_line_execs_into_the_server(fake_module):
     assert argv[1:5] == [b"-m", b"fake_iso_target", b"--port", str(port).encode()]  # exec'd: no launcher left
     assert b"agents.isolation" not in b" ".join(argv)
     assert httpx.get(f"http://127.0.0.1:{port}/health", timeout=5, trust_env=False).text == "ok"
+    # the launcher was invoked with isolation forced on (a marker gone since the mode check is then an error)
+    py = str(fake_module / "fake-python")
+    assert (fake_module / "launch.record").read_text().splitlines() == [
+        "STRANGLER_ISOLATION=on", "-m", "agents.isolation", "exec", "legacy", "--", py, "-m", "fake_iso_target",
+        "--port", str(port)]
     # already up and tracked: accepted only because the stand-in says it runs as its user
     again = _svc(fake_module, port, 0)
     assert again.returncode == 0 and "already up" in again.stdout
@@ -1247,21 +1419,28 @@ def test_stop_one_isolated_also_kills_strays_of_the_service_user(tmp_path):
     assert 'if [ -n "$ISOLATE" ]; then umask 077; fi' in (ROOT / "scripts/targets.sh").read_text()
 
 
-def test_svc_isolated_launch_fails_loudly_when_the_launcher_refuses(fake_module, tmp_path):
+@pytest.mark.parametrize("marker_repo, error", [("/elsewhere", "belongs to /elsewhere"), (None, "no marker")])
+def test_svc_isolated_launch_fails_loudly_when_the_launcher_refuses(fake_module, tmp_path, marker_repo, error):
+    """The real launcher, as svc() runs it when isolated: a marker for another checkout, or a marker that vanished
+    after the script's mode check, is an error (svc forces STRANGLER_ISOLATION=on), never an unisolated start."""
     port = free_port()
-    marker = write_marker(tmp_path, repo="/elsewhere")
-    proc = _svc(fake_module, port, 0, "export STRANGLER_ISOLATION=on",
-                f"export STRANGLER_ISOLATION_MARKER={shlex.quote(marker['STRANGLER_ISOLATION_MARKER'])}")
+    if marker_repo:
+        marker = write_marker(tmp_path, repo=marker_repo)["STRANGLER_ISOLATION_MARKER"]
+    else:
+        marker = str(tmp_path / "gone" / "isolation.json")
+    proc = _svc(fake_module, port, 0, "export STRANGLER_ISOLATION=auto",
+                f"export STRANGLER_ISOLATION_MARKER={shlex.quote(marker)}", py=sys.executable)
     assert proc.returncode == 1 and "exited during start-up" in proc.stderr
-    assert "belongs to /elsewhere" in proc.stderr  # the launcher's error, from the log
+    assert error in proc.stderr  # the launcher's error, from the log
+    assert not port_in_use(port)
 
 
 def _start_one(run: Path, prefix: str, *pre: str) -> subprocess.CompletedProcess:
     harness = "\n".join([
         "set -euo pipefail",
-        f"ROOT={shlex.quote(str(ROOT))}", f"RUN={shlex.quote(str(run))}", f"PYTHON={shlex.quote(sys.executable)}",
-        f"PREFIX={shlex.quote(prefix)}",
-        f"export STRANGLER_ISOLATION=off SR_ISO_TEST_MARK={shlex.quote(str(run))}",
+        f"ROOT={shlex.quote(str(ROOT))}", f"RUN={shlex.quote(str(run))}",
+        f"PYTHON={shlex.quote(str(fake_interpreter(run)))}", f"PREFIX={shlex.quote(prefix)}",
+        f"export SR_ISO_TEST_MARK={shlex.quote(str(run))} LAUNCH_RECORD={shlex.quote(str(run / 'launch.record'))}",
         _function(ROOT / "scripts/agents.sh", "module_for", "pid_file", "log_file", "read_pid", "is_agent_pid",
                   "agent_pid", "start_one"),
         *pre, "start_one translator", ""])
@@ -1276,6 +1455,8 @@ def test_agents_start_one_isolated_execs_into_the_agent(tmp_path):
         pid = int((tmp_path / "translator.pid").read_text())
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         assert argv[1:3] == [b"-m", b"tests.fake_agent_translator_agent"] and b"agents.isolation" not in argv
+        record = (tmp_path / "launch.record").read_text().splitlines()
+        assert record[:6] == ["STRANGLER_ISOLATION=on", "-m", "agents.isolation", "exec", "translator", "--"]
         # running but (per the stand-in) not as sr-translator: an error naming the fix, never "already running"
         proc = _start_one(tmp_path, "tests.fake_agent_", "isolated_pid() { return 1; }", "ISOLATE=1")
         assert proc.returncode == 1 and "agents.sh restart" in proc.stderr
@@ -1286,3 +1467,285 @@ def test_agents_start_one_isolated_execs_into_the_agent(tmp_path):
 def test_agents_start_one_isolated_fails_when_the_exec_never_happens(tmp_path):
     proc = _start_one(tmp_path, "tests.does_not_exist_", "isolated_pid() { return 1; }", "ISOLATE=1")
     assert proc.returncode == 1 and "did not start as sr-translator" in proc.stderr, proc.stdout + proc.stderr
+
+
+# ------------------------------------------------------------------------------- review round 2 (Opus, codex)
+
+@pytest.mark.parametrize("url, ok", [
+    ("http://127.0.0.1:18000", True), ("http://[::1]:18000", True), ("http://10.2.3.4:18000/", True),
+    ("http://localhost:18000", False), ("http://LOCALHOST:18000", False), ("http://switch.example:18000", False),
+    ("http://ip6-localhost:1", False), ("not a url", False)])
+@pytest.mark.parametrize("key", ["SWITCH_URL", "PROXY_URL", "LEGACY_URL", "MODERN_URL"])
+def test_component_urls_must_name_an_ip_literal(key, url, ok):
+    """Opus #1: `localhost` may resolve to ::1, where any service uid can listen and collect bearer keys."""
+    parent = {**PARENT_ENV, key: url}
+    switch_url = url if key == "SWITCH_URL" else "http://127.0.0.1:18000"
+    comp = "cutover-gate"  # receives all four
+    if ok:
+        assert iso.child_env(comp, parent, paths=iso.service_paths("/srv/sr"), router_token="t",
+                             switch_url=switch_url)[key] == url
+    else:
+        with pytest.raises(iso.IsolationError, match="IP literal"):
+            iso.child_env(comp, parent, paths=iso.service_paths("/srv/sr"), router_token="t", switch_url=switch_url)
+    assert iso.DEFAULT_SWITCH_URL == "http://127.0.0.1:18000"
+
+
+def _listen_as(uid: int, host: str, port: int) -> subprocess.Popen:
+    code = ("import socket, sys, time\n"
+            f"s = socket.socket(socket.AF_INET6 if ':' in {host!r} else socket.AF_INET)\n"
+            f"s.bind(({host!r}, {port})); s.listen(); print('up', flush=True); time.sleep(30)\n")
+    proc = subprocess.Popen([BASE_PYTHON, "-I", "-c", code], user=uid, group=uid, extra_groups=[], cwd="/",
+                            stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "up"
+    return proc
+
+
+@requires_root
+def test_listener_checks_cover_both_families_and_every_owner():
+    """Opus #1c: every listener on an expected port, [::1] and [::] included, must belong to the expected uid."""
+    port = free_port()
+    procs = [_listen_as(NOBODY, "127.0.0.1", port), _listen_as(NOBODY, "::1", port)]
+    try:
+        found = iso.tcp_listeners().get(port, [])
+        assert sorted(found) == sorted([("127.0.0.1", NOBODY), ("::1", NOBODY)])
+        rows = iso.listener_checks({port: ("proxy", NOBODY)})
+        assert [r.status for r in rows] == ["PASS", "PASS"]
+        assert [r.status for r in iso.listener_checks({port: ("proxy", 4242)})] == ["FAIL", "FAIL"]
+        squatter = _listen_as(0, "::1", free_port())  # nothing on a port at all: SKIP; a root squatter: FAIL
+        try:
+            other = squatter_port = iso.tcp_listeners()
+            squatter_port = next(p for p, socks in other.items() if any(u == 0 and a == "::1" for a, u in socks)
+                                 and p not in (port,))
+            assert iso.listener_checks({squatter_port: ("proxy", NOBODY)})[0].status == "FAIL"
+        finally:
+            squatter.kill()
+            squatter.wait()
+        assert iso.listener_checks({free_port(): ("legacy", NOBODY)})[0].status == "SKIP"
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+
+
+@requires_root
+def test_llm_cli_check_as_the_translator(world_tmp):
+    """Opus #3: in LLM mode the CLI must run for sr-translator and only root may be able to change it."""
+    ids = ids_for("translator")
+    assert iso.llm_cli_check(ids, {"PATH": "/usr/bin:/bin"}).status == "SKIP"  # deterministic by default
+    llm = {"PATH": "/usr/bin:/bin", "STRANGLER_TRANSLATOR_MODE": "llm"}
+    ok = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": "true --flag"})
+    assert ok.status == "PASS" and ok.actual.endswith("/true")
+    missing = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": "no-such-llm-cli-xyz -p"})
+    assert missing.status == "FAIL" and "install the LLM CLI outside /root" in missing.actual
+    unreachable = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": "/root/.local/bin/claude -p"})
+    assert unreachable.status == "FAIL"
+    tools = world_tmp / "tools"
+    tools.mkdir()
+    cli = tools / "llm"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    os.chown(tools, ids.uid, ids.gid)  # the translator could swap its own CLI: refused
+    mutable = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": str(cli)})
+    assert mutable.status == "FAIL" and "owned by uid" in mutable.actual
+
+
+@requires_root
+def test_drop_privileges_calls_prctl_and_joins_a_keyring_in_order(monkeypatch):
+    """Opus #6/#7, and a test that would notice a missing prctl (NNP is inherited in this pod): observe the calls."""
+    def child():
+        calls = []
+        real_prctl, real_join = iso._prctl, iso._join_session_keyring
+        def prctl(option, arg):
+            calls.append(["prctl", option, arg, os.geteuid()])
+            return real_prctl(option, arg)
+        iso._prctl = prctl
+        iso._join_session_keyring = lambda: (calls.append(["keyring", os.geteuid()]), real_join())[1]
+        iso.drop_privileges(NOBODY, NOBODY, [])
+        return calls
+
+    calls = in_child(child)["result"]
+    assert calls == [["prctl", iso._PR_SET_DUMPABLE, 0, 0],            # before the uid changes
+                     ["prctl", iso._PR_SET_DUMPABLE, 0, NOBODY],       # again: setresuid reset it
+                     ["prctl", iso._PR_SET_NO_NEW_PRIVS, 1, NOBODY],
+                     ["keyring", NOBODY]]
+
+    def dumpable_and_keyring():
+        lib = iso._libc()
+        lib.syscall.restype = iso.ctypes.c_long
+        get = lambda: lib.syscall(iso.ctypes.c_long(250), iso.ctypes.c_long(0), iso.ctypes.c_long(-3),  # noqa: E731
+                                  iso.ctypes.c_long(0))
+        before = get()
+        iso.drop_privileges(NOBODY, NOBODY, [])
+        return [lib.prctl(3, 0, 0, 0, 0), before, get()]
+
+    dumpable, before, after = in_child(dumpable_and_keyring)["result"]
+    assert dumpable == 0
+    if os.uname().machine == "x86_64" and after > 0:
+        assert after != before  # a fresh session keyring, not root's
+
+
+@requires_root
+def test_reset_warns_and_continues_on_a_planted_directory(world_tmp, checkout, area):
+    """Opus #8: a directory under a known name never aborts the reset (which would leave the targets down)."""
+    paths = area
+    (paths.private("proxy") / "router.json").mkdir()
+    (paths.private("fuzzer") / "divergence_registry.json").write_text("{}")
+    paths.module_file.write_text("x = 1\n")
+    owners = {"proxy": UIDS["proxy"], "fuzzer": UIDS["fuzzer"], "module": UIDS["translator"]}
+    actions = iso.reset(paths, owners=owners)
+    assert any(a.startswith("WARNING:") and "router.json" in a for a in actions)
+    assert not (paths.private("fuzzer") / "divergence_registry.json").exists() and not paths.module_file.exists()
+
+
+@requires_root
+def test_disable_and_clean_remove_the_key_copies(tmp_path, world_tmp, checkout, area, monkeypatch):
+    """Opus #9: API-key copies never outlive isolation."""
+    paths = area
+    marker = write_marker(tmp_path, service_home=str(paths.home))
+    assert all(paths.key(n).exists() for n in AGENT_KEYS)
+    actions = iso.disable(marker, running=lambda: {})
+    assert not any(paths.key(n).exists() for n in AGENT_KEYS) and paths.home.exists()
+    assert any("removed" in a and "translator.json" in a for a in actions)
+    # clean runs whatever the mode, as long as the service area exists
+    for comp in iso.COMPONENTS.values():
+        iso.prepare(comp, ids_for(comp), paths, checkout / ".state")
+    marker = write_marker(tmp_path, service_home=str(paths.home), state="setting-up")
+    monkeypatch.setenv("STRANGLER_ISOLATION", "off")
+    monkeypatch.setenv("STRANGLER_ISOLATION_MARKER", marker["STRANGLER_ISOLATION_MARKER"])
+    monkeypatch.setattr(iso, "running_components", lambda uids=(): {})
+    assert iso.clean_target() == paths
+    assert iso.main(["clean"]) == 0
+    assert os.listdir(paths.state) == []
+    monkeypatch.setenv("STRANGLER_ISOLATION_MARKER", str(tmp_path / "none.json"))
+    assert iso.clean_target() is None or iso.clean_target().home == iso.DEFAULT_SERVICE_HOME
+
+
+def test_locale_allowlist_is_explicit():
+    """Opus #10: the standard locale variables only, never an arbitrary LC_* name."""
+    parent = {"LC_ALL": "C", "LC_CTYPE": "C.UTF-8", "LC_IDENTIFICATION": "C", "LC_SECRET_TOKEN": "x",
+              "LC_ANYTHING": "y"}
+    env = iso.child_env("legacy", parent, paths=iso.service_paths("/srv/sr"))
+    assert {k for k in env if k.startswith("LC_")} == {"LC_ALL", "LC_CTYPE", "LC_IDENTIFICATION"}
+    assert env["PYTHONSAFEPATH"] == "1"
+
+
+@requires_root
+def test_relative_mirror_links_are_resolved_not_normalised(world_tmp, checkout):
+    """Opus #10: relative links are followed step by step; climbing above their tree is refused even when a
+    lexical normalisation would have said otherwise, and an in-tree detour through a link is accepted."""
+    venv = checkout / ".venv"
+    (venv / "deep").symlink_to("lib/python3.12")  # an in-tree directory link
+    (venv / "inside.py").symlink_to("deep/../../pyvenv.cfg")  # really venv/pyvenv.cfg (lexically: outside)
+    paths = iso.service_paths(world_tmp / "srv")
+    iso.ensure_service_home(paths)
+    iso.sync_mirrors(checkout, paths)
+    assert os.readlink(paths.venv / "inside.py") == "deep/../../pyvenv.cfg"
+    (venv / "escape.py").symlink_to("deep/../../../outside.py")  # really above .venv (lexically: inside .venv?)
+    with pytest.raises(iso.IsolationError, match="leaves"):
+        iso.sync_mirrors(checkout, paths)
+
+
+def _isolated_pid_harness(script: str, pid: int, name: str = "legacy") -> int:
+    harness = "\n".join(["set -euo pipefail", f"id() {{ echo {NOBODY}; }}",  # stands in for `id -u sr-<name>`
+                         _function(ROOT / script, "isolated_pid"), f"isolated_pid {pid} {name}"])
+    return subprocess.run(["bash", "-c", harness], timeout=30).returncode
+
+
+@requires_root
+@pytest.mark.parametrize("script", ["scripts/targets.sh", "scripts/agents.sh"])
+def test_the_scripts_real_isolated_pid_against_real_processes(script):
+    """The real isolated_pid(): a process dropped to the user passes; root's, or the launcher's (whose argv still
+    holds `-m agents.isolation`) does not."""
+    sleep = [BASE_PYTHON, "-I", "-c", "import time; time.sleep(30)"]
+    dropped = subprocess.Popen(sleep, user=NOBODY, group=NOBODY, extra_groups=[], cwd="/")
+    launcher = subprocess.Popen([*sleep, "-m", "agents.isolation"], user=NOBODY, group=NOBODY, extra_groups=[], cwd="/")
+    as_root = subprocess.Popen(sleep)
+    try:
+        time.sleep(0.3)
+        assert _isolated_pid_harness(script, dropped.pid) == 0
+        assert _isolated_pid_harness(script, launcher.pid) == 1
+        assert _isolated_pid_harness(script, as_root.pid) == 1
+        assert _isolated_pid_harness(script, 999999) == 1
+    finally:
+        for p in (dropped, launcher, as_root):
+            p.kill()
+            p.wait()
+
+
+@requires_root
+def test_config_checks_and_status_report_problems(tmp_path, world_tmp, checkout, area):
+    paths = area
+    env = {**write_marker(tmp_path, service_home=str(paths.home), state="setting-up"),
+           "STRANGLER_STATE_DIR": str(checkout / ".state")}
+    rows = iso.config_checks(paths, env)
+    fails = {r.check for r in rows if r.status == "FAIL"}
+    assert any("is ready and names this checkout" in c for c in fails)
+    assert "isolation mode resolves to on" in fails
+    if iso._lookup(iso.pwd.getpwnam, "sr-proxy") is None:
+        assert any("system user" in c for c in fails)
+    assert any(f"{paths.home}: trusted path" in r.check and r.status == "PASS" for r in rows)
+    paths.state.chmod(0o777)
+    rows = iso.config_checks(paths, env)
+    assert any(r.status == "FAIL" and r.check.startswith(f"{paths.state} root:root 0755") for r in rows)
+    paths.state.chmod(0o755)
+    lines = "\n".join(iso.status_lines(env))
+    assert "mode: error: isolation setup incomplete" in lines and "setting-up" in lines
+
+
+def test_live_pid_trusts_only_a_live_process_running_the_module(tmp_path):
+    env = {"STRANGLER_STATE_DIR": str(tmp_path)}
+    run = tmp_path / "run"
+    run.mkdir()
+    assert iso.live_pid("proxy", env) is None
+    for junk in ("", "garbage", "-1", "0", "999999"):
+        (run / "proxy.pid").write_text(junk)
+        assert iso.live_pid("proxy", env) is None
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    real = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "-m", "targets.proxy.router"])
+    try:
+        time.sleep(0.2)
+        (run / "proxy.pid").write_text(f"{other.pid}\n")
+        assert iso.live_pid("proxy", env) is None  # alive, but not the module
+        (run / "proxy.pid").write_text(f"{real.pid}\n")
+        assert iso.live_pid("proxy", env) == real.pid
+    finally:
+        for p in (other, real):
+            p.kill()
+            p.wait()
+
+
+@requires_root
+def test_verify_fails_cleanly_without_users_and_touches_nothing(tmp_path, world_tmp, checkout, area, monkeypatch):
+    if iso._lookup(iso.pwd.getpwnam, "sr-proxy") is not None:
+        pytest.skip("the service users exist on this host")
+    paths = area
+    env = {**write_marker(tmp_path, service_home=str(paths.home)), "STRANGLER_STATE_DIR": str(checkout / ".state")}
+    before = {p: os.lstat(p).st_mtime_ns for p in (paths.state, paths.agents)}
+    ok, rows = iso.verify(env, roots=[str(world_tmp / "nothing")])
+    assert ok is False
+    assert any(r.check == "resolve ids" and r.status == "FAIL" for r in rows)
+    assert {p: os.lstat(p).st_mtime_ns for p in (paths.state, paths.agents)} == before
+    assert "checks:" in iso.format_table(rows)
+
+
+@requires_root
+def test_isolated_svc_makes_an_older_log_private(fake_module):
+    port = free_port()
+    log = fake_module / "run" / "legacy.log"
+    log.write_text("an older, unisolated run\n")
+    log.chmod(0o644)
+    assert _svc(fake_module, port, 0).returncode == 0
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600 and "older" not in log.read_text()
+
+
+@pytest.mark.parametrize("script", ["targets.sh", "agents.sh"])
+def test_scripts_stop_before_touching_the_run_dir_when_the_mode_is_misconfigured(tmp_path, script):
+    """Behavioural companion of the structural test: with isolation on and no marker, the script exits 2 before it
+    creates or locks anything."""
+    state = tmp_path / "state"
+    env = {**os.environ, "STRANGLER_ISOLATION": "on", "STRANGLER_ISOLATION_MARKER": str(tmp_path / "none.json"),
+           "STRANGLER_STATE_DIR": str(state), "STRANGLER_RUN_DIR": str(state / "run")}
+    proc = subprocess.run(["bash", str(ROOT / "scripts" / script), "status"], env=env, capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 2 and "no marker" in proc.stderr, proc.stderr
+    assert not state.exists()

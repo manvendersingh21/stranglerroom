@@ -104,6 +104,8 @@ svc() { # name module port health
   if [ -n "${ISOLATE:-}" ]; then : >"$RUN/$name.log"; chmod 0600 "$RUN/$name.log"; fi  # an older log may be 0644
   (
     cd "$ROOT"
+    # isolated: the launcher must find isolation on too (a marker gone meanwhile is an error, never "off")
+    if [ -n "${ISOLATE:-}" ]; then export STRANGLER_ISOLATION=on; fi
     nohup ${ISOLATE:+"$PY" -m agents.isolation exec "$name" --} "$PY" -m "$module" --port "$port" >"$RUN/$name.log" 2>&1 </dev/null 9>&- &
     echo $! >"$RUN/$name.pid"
   )
@@ -117,7 +119,8 @@ svc() { # name module port health
     if curl -fsS -m 2 -o /dev/null "http://127.0.0.1:$port$health" 2>/dev/null; then
       # Isolated: the answer must come from our pid, exec'd into sr-<name>, owning the listener (not a squatter).
       if [ -n "${ISOLATE:-}" ] && ! { isolated_pid "$pid" "$name" && isolated_listener "$port" "$name"; }; then
-        kill -KILL "$pid" 2>/dev/null || true  # ours, but not running isolated: never leave it serving
+        pkill -KILL -P "$pid" 2>/dev/null || true  # ours, but not running isolated: never leave it (or its
+        kill -KILL "$pid" 2>/dev/null || true     # children, e.g. a reload worker) serving
         rm -f "$RUN/$name.pid"
         echo "  $name: :$port answers, but not from pid $pid running as sr-$name — see $RUN/$name.log" >&2; exit 1
       fi
