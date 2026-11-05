@@ -2353,7 +2353,10 @@ def listener_checks(expected: Mapping[int, tuple[str, int | None]],
         if not found:
             rows.append(Row("process", owner, f"something listens on :{port}", "yes", "no", "SKIP"))
         for addr, actual in found:
-            rows.append(_row("process", owner, f"listener {addr}:{port} belongs to uid {uid}", True, actual == uid))
+            detail = f"listener {addr}:{port} belongs to uid {uid}"
+            if actual != uid:
+                detail += f" (it belongs to uid {actual})"  # name the squatter's owner, not only the expectation
+            rows.append(_row("process", owner, detail, True, actual == uid))
     return rows
 
 

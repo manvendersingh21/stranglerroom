@@ -101,7 +101,7 @@ write_state_env() {
   mkdir -p "$STATE"
   touch "$STATE/switch.env" && chmod 600 "$STATE/switch.env"  # 0600 before the secrets are written
   cat >"$STATE/switch.env" <<EOF
-SWITCH_URL=http://localhost:${API_PORT}
+SWITCH_URL=http://127.0.0.1:${API_PORT}
 MATTERMOST_URL=http://localhost:${MM_PORT}
 AGENT_REGISTRATION_TOKEN=${AGENT_REGISTRATION_TOKEN}
 GATEWAY_ADMIN_EMAIL=${GATEWAY_ADMIN_EMAIL}
@@ -114,7 +114,7 @@ MATTERMOST_ADMIN_PASSWORD=${MATTERMOST_ADMIN_PASSWORD}
 EOF
   chmod 600 "$STATE/switch.env"
   # The public part (no secret): all an agent process needs. Agents read this file, never switch.env.
-  printf 'SWITCH_URL=http://localhost:%s\nMATTERMOST_URL=http://localhost:%s\n' "$API_PORT" "$MM_PORT" \
+  printf 'SWITCH_URL=http://127.0.0.1:%s\nMATTERMOST_URL=http://localhost:%s\n' "$API_PORT" "$MM_PORT" \
     >"$STATE/connection.env"
   chmod 644 "$STATE/connection.env"
   log "wrote .state/switch.env and .state/connection.env"
@@ -127,7 +127,7 @@ docker_up() {
   prepare_env docker
   (cd "$INFRA" && docker compose -f deploy/local/standalone-docker-compose.yml --project-directory . \
       --profile collab --profile gateway up -d)
-  wait_http "http://localhost:${API_PORT}/health" switch-core 240
+  wait_http "http://127.0.0.1:${API_PORT}/health" switch-core 240
   wait_http "http://localhost:${MM_PORT}/api/v4/system/ping" mattermost 240
   log "waiting for the setup container to exit 0"
   local cid="" status="" code="" i=0
@@ -232,26 +232,26 @@ native_mattermost() {
 }
 
 native_switch_core() {
-  if curl -fsS "http://localhost:${API_PORT}/health" 2>/dev/null | grep -q '"ok"'; then log "switch-core already running"; return; fi
+  if curl -fsS "http://127.0.0.1:${API_PORT}/health" 2>/dev/null | grep -q '"ok"'; then log "switch-core already running"; return; fi
   (
     set -a; . "$INFRA/.env"; set +a
     export DB_HOST=127.0.0.1 DB_PORT="${POSTGRES_HOST_PORT:-5432}" ID_SERVER_NAME=localhost MATRIX_SERVER_NAME=localhost
     export SERVER_HOST=127.0.0.1 SERVER_PORT="$API_PORT" COLLABORATION_CALLBACK_HOST=127.0.0.1 COLLABORATION_CALLBACK_PORT="${CALLBACK_PORT:-18081}"
     export GATEWAY_COOKIE_SECURE=false OUTBOUND_ALLOWED_PRIVATE_HOSTS=localhost,127.0.0.1
-    export GATEWAY_UI_DIR="$INFRA/gateway/dist" FRONTEND_BASE_URL="http://localhost:${API_PORT}"
+    export GATEWAY_UI_DIR="$INFRA/gateway/dist" FRONTEND_BASE_URL="http://127.0.0.1:${API_PORT}"
     export TELEMETRY_ENABLED=false THIRD_PARTY_AVATARS_ENABLED=false
     unset SWITCH_REGISTRY SWITCH_IMAGE_NAMESPACE GATEWAY_HOST_PORT API_HOST_PORT MATTERMOST_HOST_PORT POSTGRES_HOST_PORT SWITCH_BIND_ADDR FEATURE_FLAGS_ENABLED JWT_SECRET_KEY CONTROLLER_TOKEN_SECRET
     cd "$INFRA/core" || exit 1
     exec nohup .venv/bin/python -m switch_core.main >"$NATIVE/core.out" 2>&1 </dev/null &
     echo $! >"$NATIVE/switch-core.pid"
   )
-  wait_http "http://localhost:${API_PORT}/health" switch-core 180
+  wait_http "http://127.0.0.1:${API_PORT}/health" switch-core 180
 }
 
 native_setup() {
   (
     set -a; . "$INFRA/.env"; set +a
-    export SWITCH_URL="http://localhost:${API_PORT}" MATTERMOST_URL="http://localhost:${MM_PORT}"
+    export SWITCH_URL="http://127.0.0.1:${API_PORT}" MATTERMOST_URL="http://localhost:${MM_PORT}"
     export MATTERMOST_URL_FOR_SWITCH="http://localhost:${MM_PORT}" MATTERMOST_CALLBACK_BASE_URL="http://127.0.0.1:${CALLBACK_PORT:-18081}"
     local i=0
     until "$INFRA/core/.venv/bin/python" "$INFRA/deploy/shared_resources/setup.py" >"$NATIVE/setup.out" 2>&1; do

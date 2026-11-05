@@ -1,7 +1,7 @@
 """Live-stack integration test for :mod:`agents.switch_client` (docs/SWITCH_PROTOCOL.md).
 
 The live test is ``@pytest.mark.integration`` and runs against a running Switch 0.31.0 (``SWITCH_URL``, default
-``http://localhost:18000``) and is skipped with a clear reason when ``/health`` is down.
+``http://127.0.0.1:18000``) and is skipped with a clear reason when ``/health`` is down.
 
 Everything uses THROWAWAY agents (``stranglerroom-itest-a-<rand>`` / ``-b-<rand>``) in a
 throwaway ``internal_only`` room (no Mattermost channel is created, so the demo channel is
@@ -48,7 +48,7 @@ EVENT_TIMEOUT_S = 30.0
 
 def _switch_url() -> str:
     env = sc.read_env_file(REAL_STATE_DIR / "switch.env")
-    return (os.environ.get("SWITCH_URL") or env.get("SWITCH_URL") or "http://localhost:18000").rstrip("/")
+    return (os.environ.get("SWITCH_URL") or env.get("SWITCH_URL") or "http://127.0.0.1:18000").rstrip("/")
 
 
 def _require_switch() -> None:
