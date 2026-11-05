@@ -198,7 +198,17 @@ def repo_state_dir(env: Mapping[str, str] | None = None) -> Path:
     """The checkout's state directory: ``STRANGLER_STATE_DIR`` (of the launcher; relative to the checkout, where the
     launchers run everything) or ``<repo>/.state``."""
     raw = (_values(env).get("STRANGLER_STATE_DIR") or "").strip()
-    return Path(os.path.normpath(repo_root() / os.path.expanduser(raw))) if raw else repo_root() / ".state"
+    return Path(os.path.normpath(repo_root() / os.path.expanduser(no_named_home("STRANGLER_STATE_DIR", raw)))) \
+        if raw else repo_root() / ".state"
+
+
+def no_named_home(key: str, raw: str) -> str:
+    """``~name/…`` is refused, as by the scripts (the shell and Python must resolve every path override the same
+    way); a bare ``~`` or ``~/…`` and absolute or relative paths are fine."""
+    if raw.startswith("~") and raw != "~" and not raw.startswith("~/"):
+        raise IsolationError(f"{key}={raw!r}: ~user paths are not supported; use an absolute path, ~/ or a path "
+                             "relative to the checkout")
+    return raw
 
 
 def router_token_path(env: Mapping[str, str] | None = None) -> Path:
@@ -595,6 +605,8 @@ def check_ip_url(key: str, url: str) -> str:
         raise refuse("the host is not an IP literal") from None
     if address.is_unspecified:
         raise refuse("an unspecified address (0.0.0.0, ::) is not a destination")
+    if address.version == 6 and address.ipv4_mapped is not None:
+        raise refuse(f"an IPv4-mapped IPv6 address: use the IPv4 literal {address.ipv4_mapped}")
     if port is None:
         port = 443 if scheme == "https" else 80
     if not 0 < port < 65536:
@@ -895,12 +907,23 @@ def _copy_file(src: Path, src_st: os.stat_result, dir_fd: int, name: str) -> Non
 _REMOVE_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 
-def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str]) -> None:
+REMOVE_MAX_ENTRIES = 10_000_000
+REMOVE_MAX_SECONDS = 1800.0
+REMOVE_BATCH = 1024
+
+
+def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str], *, max_entries: int | None = None,
+                   max_seconds: float | None = None) -> None:
     """Remove ``name`` (an entry of ``dir_fd``) and, if it is a directory, everything below it, iteratively with an
     explicit stack: each subdirectory is opened O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK relative to its parent's
     descriptor and fstat-checked against the entry that was listed; files and links are unlinked and directories
-    removed through their parent's descriptor. Never follows a symlink, never recurses on the Python stack. A failure
-    is recorded in ``errors`` (one line per entry) and the removal goes on with the rest."""
+    removed through their parent's descriptor. Never follows a symlink, never recurses on the Python stack. Each
+    directory is read in batches of REMOVE_BATCH names (never a whole huge listing at once); entry and elapsed-time
+    budgets (REMOVE_MAX_ENTRIES, REMOVE_MAX_SECONDS) and a depth below the descriptor limit stop the removal with an
+    error. A failure is recorded in ``errors`` (one line per entry) and the removal goes on with the rest; held
+    descriptors are closed however it ends."""
+    import resource
+
     try:
         st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -914,6 +937,11 @@ def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str]) -> No
         except OSError as exc:
             errors.append(f"{label}: {exc}")
         return
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    soft = 1 << 20 if soft == resource.RLIM_INFINITY else soft
+    depth_limit = max(1, min(4096, soft // 4))
+    entries_left = REMOVE_MAX_ENTRIES if max_entries is None else max_entries
+    deadline = time.monotonic() + (REMOVE_MAX_SECONDS if max_seconds is None else max_seconds)
 
     def open_dir(parent_fd: int, entry: str, expected: os.stat_result, entry_label: Path) -> int | None:
         try:
@@ -928,46 +956,82 @@ def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str]) -> No
             return None
         return fd
 
-    def listing(fd: int, entry_label: Path) -> list[str]:
-        try:
-            return sorted(os.listdir(fd), reverse=True)
-        except OSError as exc:
-            errors.append(f"{entry_label}: {exc}")
-            return []
+    class Frame:
+        __slots__ = ("fd", "parent_fd", "name", "label", "batch", "skip")
+
+        def __init__(self, fd: int, parent_fd: int, entry: str, entry_label: Path):
+            self.fd, self.parent_fd, self.name, self.label = fd, parent_fd, entry, entry_label
+            self.batch: list[str] = []
+            self.skip: set[str] = set()  # entries that could not be removed: not listed again
+
+        def refill(self) -> bool:
+            try:
+                with os.scandir(self.fd) as entries:
+                    for entry in entries:
+                        if entry.name not in self.skip:
+                            self.batch.append(entry.name)
+                            if len(self.batch) >= REMOVE_BATCH:
+                                break
+            except OSError as exc:
+                errors.append(f"{self.label}: {exc}")
+            return bool(self.batch)
 
     top = open_dir(dir_fd, name, st, label)
     if top is None:
         return
-    # each frame: (its descriptor, its parent's descriptor, its name there, its label, entries still to remove)
-    stack: list[tuple[int, int, str, Path, list[str]]] = [(top, dir_fd, name, label, listing(top, label))]
-    while stack:
-        fd, parent_fd, entry, entry_label, pending = stack[-1]
-        if not pending:
-            stack.pop()
-            os.close(fd)
+    stack = [Frame(top, dir_fd, name, label)]
+    try:
+        while stack:
+            frame = stack[-1]
+            if not frame.batch and not frame.refill():
+                stack.pop()
+                os.close(frame.fd)
+                frame.fd = -1
+                try:
+                    os.rmdir(frame.name, dir_fd=frame.parent_fd)
+                except OSError as exc:
+                    errors.append(f"{frame.label}: {exc}")
+                    if stack:
+                        stack[-1].skip.add(frame.name)
+                continue
+            entries_left -= 1
+            if entries_left < 0 or time.monotonic() > deadline:
+                errors.append(f"{label}: removal stopped, its {'entry' if entries_left < 0 else 'time'} budget "
+                              "is exhausted")
+                return
+            child = frame.batch.pop()
+            child_label = frame.label / child
             try:
-                os.rmdir(entry, dir_fd=parent_fd)
-            except OSError as exc:
-                errors.append(f"{entry_label}: {exc}")
-            continue
-        child = pending.pop()
-        child_label = entry_label / child
-        try:
-            cst = os.stat(child, dir_fd=fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            errors.append(f"{child_label}: {exc}")
-            continue
-        if stat.S_ISDIR(cst.st_mode):
-            cfd = open_dir(fd, child, cst, child_label)
-            if cfd is not None:
-                stack.append((cfd, fd, child, child_label, listing(cfd, child_label)))
-        else:
-            try:
-                os.unlink(child, dir_fd=fd)
+                cst = os.stat(child, dir_fd=frame.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
             except OSError as exc:
                 errors.append(f"{child_label}: {exc}")
+                frame.skip.add(child)
+                continue
+            if stat.S_ISDIR(cst.st_mode):
+                if len(stack) >= depth_limit:
+                    errors.append(f"{child_label}: deeper than {depth_limit} levels, not removed")
+                    frame.skip.add(child)
+                    continue
+                cfd = open_dir(frame.fd, child, cst, child_label)
+                if cfd is None:
+                    frame.skip.add(child)
+                else:
+                    stack.append(Frame(cfd, frame.fd, child, child_label))
+            else:
+                try:
+                    os.unlink(child, dir_fd=frame.fd)
+                except OSError as exc:
+                    errors.append(f"{child_label}: {exc}")
+                    frame.skip.add(child)
+    finally:
+        for frame in stack:
+            if frame.fd >= 0:
+                try:
+                    os.close(frame.fd)
+                except OSError:
+                    pass
 
 
 def _remove_any(dir_fd: int, name: str) -> None:
@@ -1412,13 +1476,18 @@ _KEYCTL_JOIN_SESSION_KEYRING = 1
 _KEY_SPEC_SESSION_KEYRING = -3
 
 
-def _keyctl(*args: int | None) -> tuple[int, int]:
-    """(return value, errno) of keyctl(*args); errno ENOSYS where this architecture's number is unknown."""
+def _keyctl_number() -> int | None:
+    """keyctl(2)'s syscall number on this architecture, or None if it is not known."""
     import platform
 
-    number = _KEYCTL_SYSCALL.get(platform.machine())
+    return _KEYCTL_SYSCALL.get(platform.machine())
+
+
+def _keyctl(*args: int | None) -> tuple[int, int]:
+    """(return value, errno) of the real keyctl(*args) syscall. Callers check ``_keyctl_number()`` first."""
+    number = _keyctl_number()
     if number is None:
-        return -1, errno.ENOSYS
+        raise IsolationError("keyctl(2) is not known on this architecture")
     libc = _libc()
     libc.syscall.restype = ctypes.c_long
     argv = [ctypes.c_long(number)] + [ctypes.c_void_p(None) if a is None else ctypes.c_long(a) for a in args]
@@ -1426,35 +1495,26 @@ def _keyctl(*args: int | None) -> tuple[int, int]:
     return ret, (ctypes.get_errno() if ret < 0 else 0)
 
 
-def _no_inherited_keyring() -> bool:
-    """Proof that there is no session keyring to leave: the kernel lists no key for us (/proc/keys absent or empty)
-    and asking for the session keyring without creating it fails."""
-    try:
-        with open("/proc/keys", encoding="ascii", errors="replace") as fh:
-            if fh.read().strip():
-                return False
-    except FileNotFoundError:
-        pass  # no keys facility at all
-    except OSError:
-        return False
-    ret, _err = _keyctl(_KEYCTL_GET_KEYRING_ID, _KEY_SPEC_SESSION_KEYRING, 0)
-    return ret < 0
-
-
 def _join_session_keyring() -> None:
     """Leave the launcher's (root's) session keyring for a new anonymous one, so no key root holds is reachable.
-    Fails closed: only ENOSYS (no keys facility) and EKEYREVOKED (the inherited keyring is already revoked) are
-    tolerated; any other failure (EPERM, an unknown architecture) is an error unless there is provably no inherited
-    session keyring."""
+    Fails closed. Accepted only: a successful join; a genuine ENOSYS from the real syscall on a known architecture
+    (the kernel has no keys facility); or, when the join fails, asking for the session keyring without creating it
+    failing with ENOKEY (there is none) or EKEYREVOKED (it is revoked). Anything else (EPERM, EACCES, an unknown
+    architecture; an empty /proc/keys proves nothing: it may be masked) is an error."""
+    import platform
+
+    if _keyctl_number() is None:
+        raise IsolationError(f"keyctl(2) is not known on {platform.machine()}: cannot leave the inherited session "
+                             "keyring; refusing to run with root's keys possibly reachable")
     ret, err = _keyctl(_KEYCTL_JOIN_SESSION_KEYRING, None)
-    if ret >= 0 or err == errno.EKEYREVOKED:
+    if ret >= 0 or err == errno.ENOSYS:
         return
-    if err == errno.ENOSYS and not os.path.exists("/proc/keys"):
-        return  # the kernel has no keys facility
-    if _no_inherited_keyring():
+    got, got_err = _keyctl(_KEYCTL_GET_KEYRING_ID, _KEY_SPEC_SESSION_KEYRING, 0)
+    if got < 0 and got_err in (errno.ENOKEY, errno.EKEYREVOKED):
         return
-    raise IsolationError(f"cannot leave the inherited session keyring ({os.strerror(err)}); refusing to run "
-                         "with root's keys reachable")
+    raise IsolationError(f"cannot leave the inherited session keyring (join: {os.strerror(err)}; session keyring "
+                         f"lookup: {os.strerror(got_err) if got < 0 else 'present'}); refusing to run with root's "
+                         "keys reachable")
 
 
 def close_inherited_fds() -> None:
@@ -1767,7 +1827,7 @@ FRESH_HINT = "start from a clean state with `scripts/targets.sh start --fresh` (
 def _checkout_state_items(values: Mapping[str, str]) -> list[Path]:
     """Component state of the unisolated layout (the checkout's .state and generated module) that exists."""
     state = repo_state_dir(values)
-    raw = (values.get("MODERN_LISTS_PATH") or "").strip()
+    raw = no_named_home("MODERN_LISTS_PATH", (values.get("MODERN_LISTS_PATH") or "").strip())
     module = Path(os.path.normpath(repo_root() / raw)) if raw else (
         repo_root() / "targets" / "modern_fastapi" / "app" / "lists.py")
     items = [state / "proxy" / "router.json", state / "fuzzer", state / "translator", module]
@@ -2137,71 +2197,124 @@ SCAN_MAX_DEPTH = 1024
 #: it fails verification with an "incomplete" row. Sized for hosts that hold large world-readable archives.
 SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024 * 1024
 SCAN_MAX_FILES = 2_000_000
+#: budgets of root's listing (before any child reads): entries seen, directories entered, seconds
+SCAN_MAX_ENTRIES = 5_000_000
+SCAN_MAX_DIRS = 1_000_000
+SCAN_MAX_SECONDS = 900.0
 SCAN_CHUNK = 1024 * 1024
 
 
 def scan_candidates(roots: Iterable[str | Path], *, problems: list[str] | None = None,
-                    max_depth: int | None = None) -> list[tuple[str, list[str]]]:
+                    max_depth: int | None = None, max_entries: int | None = None, max_dirs: int | None = None,
+                    max_seconds: float | None = None) -> list[tuple[str, list[str]]]:
     """(directory, [regular files and symlinks]) for every directory under ``roots``, listed as root by an iterative
     descriptor walk (not ``os.fwalk``, which opens a symlinked directory before checking it): each subdirectory is
     opened O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK relative to its parent's descriptor, so a directory a service swaps for a
-    symlink (or a device) mid-walk is neither followed nor opened. Directories deeper than ``max_depth`` are not
-    listed; each is reported in ``problems`` (verify fails on it). Root only lists names here; it never opens a
-    candidate nor resolves a link (only the dropped child does, ``search_readable``)."""
-    max_depth = SCAN_MAX_DEPTH if max_depth is None else max_depth
+    symlink (or a device) mid-walk is neither followed nor opened. Entries are read incrementally against entry,
+    directory and elapsed-time budgets (SCAN_MAX_ENTRIES, SCAN_MAX_DIRS, SCAN_MAX_SECONDS); the depth is capped below
+    the descriptor limit (one held per level). Anything that makes the listing incomplete is reported in
+    ``problems`` (verify fails on it): a budget or the depth cap reached, or any listing or open failure inside an
+    existing tree (EMFILE included). A root that does not exist is fine; an entry vanishing mid-walk is ignored. Root
+    only lists names here; it never opens a candidate nor resolves a link (only the dropped child does)."""
+    import resource
+
+    problems = [] if problems is None else problems
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    soft = 1 << 20 if soft == resource.RLIM_INFINITY else soft
+    depth_limit = max(1, min(SCAN_MAX_DEPTH if max_depth is None else max_depth, 256, soft // 4))
+    budget = {"entries": SCAN_MAX_ENTRIES if max_entries is None else max_entries,
+              "dirs": SCAN_MAX_DIRS if max_dirs is None else max_dirs}
+    deadline = time.monotonic() + (SCAN_MAX_SECONDS if max_seconds is None else max_seconds)
     out: list[tuple[str, list[str]]] = []
     seen: set[str] = set()
     flags = _DIR_FLAGS | os.O_NONBLOCK
     # each frame: (descriptor, path, depth, subdirectory names still to visit)
     stack: list[tuple[int, str, int, list[str]]] = []
 
+    def exhausted() -> str | None:
+        if budget["entries"] < 0:
+            return f"entry budget of {SCAN_MAX_ENTRIES if max_entries is None else max_entries} reached"
+        if budget["dirs"] < 0:
+            return f"directory budget of {SCAN_MAX_DIRS if max_dirs is None else max_dirs} reached"
+        if time.monotonic() > deadline:
+            return "time budget reached"
+        return None
+
     def enter(fd: int, path: str, depth: int) -> None:
+        """List one directory (taking ownership of ``fd``) and push it; budgets are checked per entry."""
         if path in seen:
             os.close(fd)
             return
         seen.add(path)
+        budget["dirs"] -= 1
         files, subdirs = [], []
         try:
-            names = sorted(os.listdir(fd))
-        except OSError:
-            names = []
-        for name in names:
-            try:
-                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
-            except OSError:
-                continue
-            if stat.S_ISDIR(st.st_mode):
-                subdirs.append(name)
-            elif stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
-                files.append(name)
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    budget["entries"] -= 1
+                    if exhausted():
+                        break
+                    try:
+                        st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        problems.append(f"{os.path.join(path, entry.name)}: {exc}")
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        subdirs.append(entry.name)
+                    elif stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+                        files.append(entry.name)
+        except OSError as exc:
+            problems.append(f"{path}: cannot list ({exc})")
         out.append((path, files))
-        stack.append((fd, path, depth, subdirs[::-1]))
+        stack.append((fd, path, depth, sorted(subdirs, reverse=True)))
 
-    for root in roots:
-        root = os.path.normpath(str(root))
-        try:
-            root_fd = os.open(root, flags)
-        except OSError:
-            continue
-        enter(root_fd, root, 0)
-        while stack:
-            fd, path, depth, pending = stack[-1]
-            if not pending:
-                stack.pop()
-                os.close(fd)
-                continue
-            name = pending.pop()
-            child_path = os.path.join(path, name)
-            if depth + 1 > max_depth:
-                if problems is not None:
-                    problems.append(f"{child_path}: deeper than {max_depth} levels, not scanned")
-                continue
+    try:
+        for root in roots:
+            root = os.path.normpath(str(root))
             try:
-                child = os.open(name, flags, dir_fd=fd)
-            except OSError:
+                root_fd = os.open(root, flags)
+            except FileNotFoundError:
+                continue  # an optional root that does not exist
+            except OSError as exc:
+                problems.append(f"{root}: cannot open ({exc})")
                 continue
-            enter(child, child_path, depth + 1)
-    return out
+            enter(root_fd, root, 0)
+            while stack:
+                why = exhausted()
+                if why:
+                    problems.append(f"listing stopped: {why}")
+                    return out
+                fd, path, depth, pending = stack[-1]
+                if not pending:
+                    stack.pop()
+                    os.close(fd)
+                    continue
+                name = pending.pop()
+                child_path = os.path.join(path, name)
+                if depth + 1 > depth_limit:
+                    problems.append(f"{child_path}: deeper than {depth_limit} levels, not scanned")
+                    continue
+                try:
+                    child = os.open(name, flags, dir_fd=fd)
+                except FileNotFoundError:
+                    continue  # vanished meanwhile
+                except OSError as exc:  # EMFILE, ENFILE, a directory swapped for a link, ...: coverage incomplete
+                    problems.append(f"{child_path}: cannot open ({exc})")
+                    continue
+                enter(child, child_path, depth + 1)
+            why = exhausted()
+            if why:
+                problems.append(f"listing stopped: {why}")
+                return out
+        return out
+    finally:
+        for fd, _path, _depth, _pending in stack:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 #: caps for the directories a dropped child reaches only through symlinks (they may lead anywhere, even in loops)
@@ -2320,19 +2433,23 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
 
     def walk(top: str, key: tuple[int, int]) -> None:
         stack = [(top, key)]
-        while stack:
+        while stack and not state["truncated"]:  # a cap reached stops the walk
             dirpath, key = stack.pop()
             if key in visited:
                 continue
             visited.add(key)
             try:
-                names = sorted(os.listdir(dirpath))
+                with os.scandir(dirpath) as entries:  # incremental: never a whole huge listing at once
+                    for entry in entries:
+                        if state["truncated"]:
+                            break
+                        visit(os.path.join(dirpath, entry.name), stack)
             except OSError:
                 continue
-            for name in names:
-                visit(os.path.join(dirpath, name), stack)
 
     for dirpath, files in candidates:
+        if state["truncated"]:  # a budget reached: stop (the result says so)
+            break
         if not os.access(dirpath, os.X_OK):
             continue
         for name in files:
@@ -2513,17 +2630,39 @@ def secret_values(repo_state: Path, repo: Path, *, env: Mapping[str, str] | None
     return {k: v for k, v in out.items() if v}
 
 
+def read_pid_file(component: Component | str, env: Mapping[str, str] | None = None) -> int | None:
+    """The pid recorded for ``component``, read only through a validated run directory (``open_trusted_dir``: root
+    owns and alone can change every part of its path), relative to its descriptor, O_NOFOLLOW, from a regular file
+    (fstat), at most 64 bytes: a pid file a service planted or swapped (a FIFO, a link) is never followed or read."""
+    comp = _component(component)
+    try:
+        dfd = open_trusted_dir(run_dir_for(comp, env))
+    except (IsolationError, OSError):
+        return None
+    if dfd is None:
+        return None
+    try:
+        try:
+            fd = os.open(f"{comp.name}.pid", _FILE_FLAGS, dir_fd=dfd)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            raw = os.read(fd, 64)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    text = raw.decode("ascii", "replace").strip()
+    return int(text) if text.isdigit() and 0 < int(text) < 1 << 31 else None
+
+
 def live_pid(component: Component | str, env: Mapping[str, str] | None = None) -> int | None:
     """The component's pid from its pid file, if that process is alive and runs the component's module."""
     comp = _component(component)
-    try:
-        raw = (run_dir_for(comp, env) / f"{comp.name}.pid").read_text().strip()
-    except OSError:
-        return None
-    if not raw.isdigit() or int(raw) <= 0:
-        return None
-    pid = int(raw)
-    if comp.module not in _module_pairs(_proc_bytes(pid, "cmdline") or b""):
+    pid = read_pid_file(comp, env)
+    if pid is None or comp.module not in _module_pairs(_proc_bytes(pid, "cmdline") or b""):
         return None
     return pid
 
@@ -2647,14 +2786,10 @@ def _descends_from(pid: int, ancestor: int | None) -> bool:
 def tracked_pid(component: Component | str, env: Mapping[str, str] | None = None) -> int | None:
     """The live pid recorded in the component's pid file, whatever its argv now says (a process can rewrite its
     argv; verify then checks it by uid and session)."""
-    comp = _component(component)
-    try:
-        raw = (run_dir_for(comp, env) / f"{comp.name}.pid").read_text().strip()
-    except OSError:
+    pid = read_pid_file(component, env)
+    if pid is None or _proc_status(pid) is None:
         return None
-    if not raw.isdigit() or int(raw) <= 0 or _proc_status(int(raw)) is None:
-        return None
-    return int(raw)
+    return pid
 
 
 _TOKEN_LABELS = frozenset({"ROUTER_ADMIN_TOKEN", "router.token", "ROUTER_TOKEN_FILE"})
@@ -2845,10 +2980,27 @@ _ENDPOINT_DEFAULTS = {"PROXY_URL": "http://127.0.0.1:9000", "LEGACY_URL": "http:
 _ENDPOINT_OWNER = {"SWITCH_URL": "switch", "PROXY_URL": "proxy", "LEGACY_URL": "legacy", "MODERN_URL": "modern"}
 
 
+def is_local_address(address: Any) -> bool:
+    """Loopback, or an address of this host (a bind to (address, 0) succeeds): a listener there is on this host,
+    so who owns it is checked."""
+    import socket
+
+    if address.is_loopback:
+        return True
+    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind((str(address), 0))
+        return True
+    except OSError:
+        return False
+
+
 def _expected_listeners(values: Mapping[str, str]) -> dict[int, tuple[str, int | None]]:
     """port -> (owner, uid) for every local endpoint a component dials, as it will actually dial it (environment or
     the component's default, canonical form, scheme default port) plus the ports targets.sh binds. Only loopback
-    endpoints are local; remote ones are not checked. Two owners expected on one port is an error."""
+    endpoints and addresses of this host are local (``is_local_address``); remote ones are not checked. Two owners
+    expected on one port is an error."""
     import ipaddress
     from urllib.parse import urlsplit
 
@@ -2862,7 +3014,7 @@ def _expected_listeners(values: Mapping[str, str]) -> dict[int, tuple[str, int |
     for key, owner in _ENDPOINT_OWNER.items():
         raw = resolve_switch_url(values) if key == "SWITCH_URL" else (values.get(key) or _ENDPOINT_DEFAULTS[key])
         url = urlsplit(check_ip_url(key, raw))
-        if ipaddress.ip_address(url.hostname or "").is_loopback:
+        if is_local_address(ipaddress.ip_address(url.hostname or "")):
             wanted.append((url.port or 80, owner))
     wanted += [(9000, "proxy"), (9001, "legacy"), (9002, "modern")]
     expected: dict[int, tuple[str, int | None]] = {}

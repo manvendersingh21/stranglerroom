@@ -1412,11 +1412,10 @@ def test_isolated_listener_reads_the_socket_owner(fake_module):
     assert subprocess.run(["bash", "-c", harness], timeout=30).returncode == 1  # no listener at all
 
 
-@pytest.mark.parametrize("mode_vars", ["ISOLATE=1 MODE_UNKNOWN=", "ISOLATE= MODE_UNKNOWN=1"])
-def test_stop_one_isolated_also_kills_strays_of_the_service_user(tmp_path, mode_vars):
+def test_stop_one_isolated_also_kills_strays_of_the_service_user(tmp_path):
     calls = tmp_path / "calls"
     harness = "\n".join([
-        "set -euo pipefail", f"RUN={shlex.quote(str(tmp_path))}", mode_vars,
+        "set -euo pipefail", f"RUN={shlex.quote(str(tmp_path))}", "ISOLATE=1 MODE_UNKNOWN=",
         f"kill_service_user() {{ echo \"$*\" >>{shlex.quote(str(calls))}; }}",
         _function(ROOT / "scripts/targets.sh", "is_target_pid", "stop_one"),
         "echo 999999 >\"$RUN/legacy.pid\"", "stop_one legacy targets.legacy_openlibrary.server 9001"])
@@ -1431,8 +1430,9 @@ def test_stop_one_isolated_also_kills_strays_of_the_service_user(tmp_path, mode_
 
 @pytest.mark.parametrize("script", ["scripts/targets.sh", "scripts/agents.sh"])
 def test_kill_service_user_repeats_until_none_is_left_then_reports(tmp_path, script):
-    """Scripts 10a: pkill is repeated (bounded) until pgrep finds no process of the user; survivors are reported."""
-    for survivors_after, expect_warning in ((3, False), (999, True)):
+    """Scripts 10a: pkill is repeated (bounded) until pgrep finds no process of the user; survivors after a final
+    inventory make it fail (codex round 3 #6), naming them."""
+    for survivors_after, expect_failure in ((3, False), (999, True)):
         count = tmp_path / f"count-{survivors_after}"
         count.write_text("0")
         harness = "\n".join([
@@ -1440,11 +1440,11 @@ def test_kill_service_user_repeats_until_none_is_left_then_reports(tmp_path, scr
             f"pkill() {{ n=$(cat {count}); echo $((n + 1)) >{count}; }}",
             f"pgrep() {{ [ \"$(cat {count})\" -lt {survivors_after} ] && echo 4242; "
             f"[ \"$(cat {count})\" -lt {survivors_after} ]; }}",
-            _function(ROOT / script, "kill_service_user"), "kill_service_user sr-legacy"])
+            _function(ROOT / script, "kill_service_user"), "kill_service_user srtest-legacy"])
         proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
-        assert proc.returncode == 0, proc.stderr
+        assert proc.returncode == (1 if expect_failure else 0), proc.stderr
         assert int(count.read_text()) == min(survivors_after, 50)
-        assert ("survive repeated KILL" in proc.stderr) == expect_warning, proc.stderr
+        assert ("survive repeated KILL: 4242" in proc.stderr) == expect_failure, proc.stderr
 
 
 @pytest.mark.parametrize("marker_repo, error", [("/elsewhere", "belongs to /elsewhere"), (None, "no marker")])
@@ -1773,7 +1773,7 @@ def test_isolated_svc_makes_an_older_log_private(fake_module):
 TEST_USER_PREFIX = "srtest-"  # names no real user: the scripts' service users become srtest-<name>
 
 
-def _no_real_kills(tmp_path: Path) -> tuple[dict, Path]:
+def _no_real_kills(tmp_path: Path, *, survivors: bool = False) -> tuple[dict, Path]:
     """The environment for running the REAL scripts with isolation on or in "mode unknown", whose stop kills every
     service user's processes, on a host that may run a live isolated stack as sr-* users:
     * STRANGLER_SERVICE_USER_PREFIX=srtest-: the service users the scripts act on do not exist;
@@ -1785,8 +1785,10 @@ def _no_real_kills(tmp_path: Path) -> tuple[dict, Path]:
     record = f'echo "$(basename "$0") $*" >>{shlex.quote(str(calls))}'
     stubs = {
         "pkill": f"#!/bin/sh\n{record}\nexit 0\n",
-        "pgrep": f"#!/bin/sh\n{record}\nexit 1\n",
+        # survivors: a process of the (nonexistent) service user that never goes away, as seen by pgrep
+        "pgrep": f"#!/bin/sh\n{record}\n" + ("echo 4242\nexit 0\n" if survivors else "exit 1\n"),
         "id": f'#!/bin/sh\ncase "$*" in *{TEST_USER_PREFIX}*) echo 4242424 ;; *) exit 1 ;; esac\n',
+        "sleep": "#!/bin/sh\nexit 0\n",
     }
     for name, body in stubs.items():
         (bin_dir / name).write_text(body)
@@ -1932,16 +1934,24 @@ def test_drop_privileges_refuses_suid_dumpable_1_before_changing_ids():
         assert in_child(child, policy)["result"] == ["dropped", [NOBODY] * 3]
 
 
-@pytest.mark.parametrize("ret, err, no_keyring, outcome", [
-    (5, 0, False, "joined"),
-    (-1, iso.errno.EKEYREVOKED, False, "joined"),
-    (-1, iso.errno.EPERM, False, "refused"),
-    (-1, iso.errno.EPERM, True, "joined"),       # provably nothing to leave
-    (-1, iso.errno.EACCES, False, "refused"),
+E = iso.errno
+
+
+@pytest.mark.parametrize("join, lookup, outcome", [
+    ((5, 0), None, "joined"),                              # joined a new session keyring
+    ((-1, E.ENOSYS), None, "joined"),                      # the real syscall: no keys facility
+    ((-1, E.EPERM), (-1, E.ENOKEY), "joined"),             # join denied, but there is no session keyring
+    ((-1, E.EPERM), (-1, E.EKEYREVOKED), "joined"),        # ... or it is revoked
+    ((-1, E.EKEYREVOKED), (-1, E.EKEYREVOKED), "joined"),
+    ((-1, E.EPERM), (-1, E.EPERM), "refused"),             # codex round 3 #1: a denied lookup proves nothing
+    ((-1, E.EPERM), (-1, E.EACCES), "refused"),
+    ((-1, E.EACCES), (7, 0), "refused"),                   # a session keyring is there and stays
+    ((-1, E.EPERM), (-1, E.ENOSYS), "refused"),
 ])
-def test_keyring_separation_fails_closed(monkeypatch, ret, err, no_keyring, outcome):
-    monkeypatch.setattr(iso, "_keyctl", lambda *args: (ret, err))
-    monkeypatch.setattr(iso, "_no_inherited_keyring", lambda: no_keyring)
+def test_keyring_separation_fails_closed(monkeypatch, join, lookup, outcome):
+    answers = {iso._KEYCTL_JOIN_SESSION_KEYRING: join, iso._KEYCTL_GET_KEYRING_ID: lookup}
+    monkeypatch.setattr(iso, "_keyctl_number", lambda: 250)
+    monkeypatch.setattr(iso, "_keyctl", lambda op, *args: answers[op])
     if outcome == "refused":
         with pytest.raises(iso.IsolationError, match="session keyring"):
             iso._join_session_keyring()
@@ -1949,16 +1959,15 @@ def test_keyring_separation_fails_closed(monkeypatch, ret, err, no_keyring, outc
         iso._join_session_keyring()
 
 
-def test_keyring_unknown_architecture_is_not_a_silent_skip(monkeypatch):
+def test_keyring_unknown_architecture_is_refused_not_skipped(monkeypatch):
     import platform
 
-    if not os.path.exists("/proc/keys"):
-        pytest.skip("this kernel has no keys facility")
     monkeypatch.setattr(platform, "machine", lambda: "unknown-arch")
-    assert iso._keyctl(1, None) == (-1, iso.errno.ENOSYS)
-    monkeypatch.setattr(iso, "_no_inherited_keyring", lambda: False)
-    with pytest.raises(iso.IsolationError, match="session keyring"):
+    assert iso._keyctl_number() is None
+    with pytest.raises(iso.IsolationError, match="not known on unknown-arch"):
         iso._join_session_keyring()
+    with pytest.raises(iso.IsolationError):
+        iso._keyctl(1, None)  # never a synthetic errno that could pass for the kernel's answer
 
 
 @requires_root
@@ -2364,3 +2373,241 @@ def test_the_read_budget_is_global_for_the_run(world_tmp, monkeypatch):
     assert any(r.status == "FAIL" and "total read cap" in r.check for r in legacy), legacy
     assert all(r.status != "PASS" for r in legacy if "besides the world" in r.check)
     assert iso.SCAN_MAX_TOTAL_BYTES == 300  # (monkeypatched; the real budget is 32 GiB and 2M files per run)
+
+
+# ------------------------------------------------------------------------------- codex review of round 3
+# Same safety rules: stand-ins for pkill/pgrep/id/sleep/kill, the srtest- service-user prefix, tmp fixtures only.
+
+def _isolated_script_env(tmp_path: Path, *, survivors: bool) -> tuple[dict, Path, Path]:
+    """Run the REAL scripts with isolation on (a ready marker for this checkout in tmp_path, a tmp state and run
+    dir), every signal and process lookup stubbed, and service users that do not exist."""
+    stub_env, calls = _no_real_kills(tmp_path, survivors=survivors)
+    state = tmp_path / "state"
+    marker = write_marker(tmp_path, service_home=str(tmp_path / "srv"))
+    env = {**os.environ, **stub_env, **marker, "STRANGLER_ISOLATION": "auto", "STRANGLER_STATE_DIR": str(state),
+           "STRANGLER_RUN_DIR": str(state / "run")}
+    return env, calls, state
+
+
+@requires_root
+def test_a_failed_sweep_stops_restart_and_fresh_from_proceeding(tmp_path):
+    """codex round 3 #6: survivors make stop fail after every service was attempted; restart does not start and
+    `start --fresh` neither resets state nor starts anything."""
+    env, calls, state = _isolated_script_env(tmp_path, survivors=True)
+
+    def run(script, *args):
+        return subprocess.run(["bash", str(ROOT / "scripts" / script), *args], env=env, capture_output=True,
+                              text=True, timeout=120)
+
+    proc = run("agents.sh", "stop")
+    assert proc.returncode == 1 and "survived the stop" in proc.stderr, proc.stderr
+    swept = {line.split()[-1] for line in calls.read_text().splitlines() if line.startswith("pkill")}
+    assert swept == {f"{TEST_USER_PREFIX}{n}" for n in ("translator", "fuzzer", "cutover-gate")}  # all attempted
+    proc = run("agents.sh", "restart")
+    assert proc.returncode == 1 and "not restarting" in proc.stderr and "started" not in proc.stdout, proc.stderr
+    assert not list((state / "run").glob("*.pid"))
+    registry = state / "fuzzer" / "divergence_registry.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{}")
+    proc = run("targets.sh", "start", "--fresh")
+    assert proc.returncode == 1 and "not resetting state nor starting" in proc.stderr, proc.stderr
+    assert registry.exists() and "starting targets" not in proc.stdout
+    calls.write_text("")
+    proc = run("targets.sh", "stop")
+    assert proc.returncode == 1
+    swept = {line.split()[-1] for line in calls.read_text().splitlines() if line.startswith("pkill")}
+    assert swept == {f"{TEST_USER_PREFIX}{n}" for n in ("proxy", "modern", "legacy")}
+
+
+@pytest.mark.parametrize("script, pid_name", [("agents.sh", "translator.pid"), ("targets.sh", "proxy.pid")])
+def test_unknown_mode_stop_reads_no_pid_file(tmp_path, script, pid_name):
+    """codex round 3 #4: with the mode unknown the run directory is unvalidated: a FIFO a service planted as a pid
+    file would block `cat`; stop must not touch it and only sweep the service accounts."""
+    state = tmp_path / "state"
+    run_dir = state / "run"
+    run_dir.mkdir(parents=True)
+    os.mkfifo(run_dir / pid_name)
+    stub_env, calls = _no_real_kills(tmp_path)
+    env = {**os.environ, **stub_env, "STRANGLER_ISOLATION": "on",
+           "STRANGLER_ISOLATION_MARKER": str(tmp_path / "none.json"), "STRANGLER_STATE_DIR": str(state),
+           "STRANGLER_RUN_DIR": str(run_dir)}
+    for cmd in ("stop", "status"):
+        proc = subprocess.run(["bash", str(ROOT / "scripts" / script), cmd], env=env, capture_output=True, text=True,
+                              timeout=30)
+        assert proc.returncode == 0 and "reads no pid file" in proc.stderr, proc.stderr
+    assert stat.S_ISFIFO(os.lstat(run_dir / pid_name).st_mode)  # neither read nor removed
+    assert any(line.startswith("pgrep") for line in calls.read_text().splitlines())
+
+
+def test_python_reads_pid_files_only_through_a_validated_run_dir(tmp_path):
+    """codex round 3 #4: descriptor-relative, O_NOFOLLOW, regular files only, at most 64 bytes."""
+    env = {"STRANGLER_STATE_DIR": str(tmp_path)}
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "legacy.pid").write_text(f"{os.getpid()}\n")
+    assert iso.read_pid_file("legacy", env) == os.getpid()
+    (run_dir / "legacy.pid").write_text("1" * 100)  # more than 64 bytes: never a pid
+    assert iso.read_pid_file("legacy", env) is None
+    (run_dir / "legacy.pid").unlink()
+    os.mkfifo(run_dir / "legacy.pid")  # would block a plain read
+    assert iso.read_pid_file("legacy", env) is None
+    (run_dir / "legacy.pid").unlink()
+    (tmp_path / "elsewhere.pid").write_text(f"{os.getpid()}\n")
+    (run_dir / "legacy.pid").symlink_to(tmp_path / "elsewhere.pid")
+    assert iso.read_pid_file("legacy", env) is None
+    (run_dir / "legacy.pid").unlink()
+    (run_dir / "legacy.pid").write_text(f"{os.getpid()}\n")
+    run_dir.chmod(0o777)  # an untrusted run directory: nothing is read from it
+    assert iso.read_pid_file("legacy", env) is None and iso.tracked_pid("legacy", env) is None
+    run_dir.chmod(0o755)
+    assert iso.tracked_pid("legacy", env) == os.getpid()
+
+
+@requires_root
+def test_scan_listing_budgets_and_failures_make_coverage_incomplete(world_tmp, monkeypatch):
+    """codex round 3 #2/#3: entry, directory and time budgets; EMFILE or any open failure inside an existing tree;
+    held descriptors closed however the walk ends. A missing optional root is fine."""
+    tree = world_tmp / "tree"
+    for i in range(5):
+        (tree / f"d{i}").mkdir(parents=True)
+        for j in range(4):
+            (tree / f"d{i}" / f"f{j}").write_text("x")
+
+    def fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    before = fds()
+    for kwargs, expected in (({"max_entries": 6}, "entry budget"), ({"max_dirs": 2}, "directory budget"),
+                             ({"max_seconds": -1}, "time budget")):
+        problems: list[str] = []
+        iso.scan_candidates([tree], problems=problems, **kwargs)
+        assert any(expected in p for p in problems), (kwargs, problems)
+        assert fds() == before  # nothing left open
+    problems = []
+    assert iso.scan_candidates([world_tmp / "no-such-root"], problems=problems) == [] and problems == []
+    real_open = os.open
+
+    def emfile(path, flags, *args, **kwargs):
+        if path == "d3":
+            raise OSError(iso.errno.EMFILE, "Too many open files")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(iso.os, "open", emfile)
+    problems = []
+    listed = iso.scan_candidates([tree], problems=problems)
+    monkeypatch.setattr(iso.os, "open", real_open)
+    assert any("d3" in p and "Too many open files" in p for p in problems), problems
+    assert not any(d.endswith("/d3") for d, _ in listed) and fds() == before
+    monkeypatch.setattr(iso, "scan_candidates",
+                        lambda roots, problems=None, **kw: (problems.append("x: cannot open (EMFILE)"), [])[1])
+    rows = iso.secret_scan({"x": iso.Ids(NOBODY, NOBODY)}, {"n": "needle-0123456789"}, [tree])
+    assert any(r.status == "FAIL" and "incomplete listing" in r.check for r in rows)
+    assert all(r.status == "FAIL" for r in rows if "besides the world" in r.check)
+
+
+@requires_root
+def test_scan_depth_stays_below_the_descriptor_limit(world_tmp):
+    """codex round 3 #3: the depth cap is min(256, RLIMIT_NOFILE/4); deeper levels are reported, not silently cut."""
+    deep = world_tmp / "deep"
+    path = deep
+    for _ in range(14):
+        path = path / "d"
+    path.mkdir(parents=True)
+
+    def child():
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (40, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+        problems: list[str] = []
+        iso.scan_candidates([str(deep)], problems=problems)
+        return problems
+
+    problems = in_child(child)["result"]
+    assert problems and all("deeper than 10 levels" in p for p in problems), problems
+
+
+@requires_root
+def test_remove_tree_batches_and_budgets(world_tmp):
+    """codex round 3 #2: removal reads directories in batches (more entries than one batch) and stops with an error
+    at its entry budget, leaving the rest and no open descriptor."""
+    big = world_tmp / "big"
+    big.mkdir()
+    for i in range(iso.REMOVE_BATCH + 300):
+        (big / f"f{i:05d}").write_text("")
+    before = len(os.listdir("/proc/self/fd"))
+    dfd = os.open(world_tmp, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        errors: list[str] = []
+        iso.remove_tree_at(dfd, "big", big, errors)
+        assert errors == [] and not big.exists()
+        budgeted = world_tmp / "budgeted"
+        budgeted.mkdir()
+        for i in range(10):
+            (budgeted / f"f{i}").write_text("")
+        iso.remove_tree_at(dfd, "budgeted", budgeted, errors, max_entries=3)
+        assert any("entry budget is exhausted" in e for e in errors) and 0 < len(os.listdir(budgeted)) < 10
+        errors = []
+        iso.remove_tree_at(dfd, "budgeted", budgeted, errors, max_seconds=-1)
+        assert any("time budget is exhausted" in e for e in errors)
+    finally:
+        os.close(dfd)
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_symlink_walk_stops_at_its_cap(world_tmp):
+    target = world_tmp / "many"
+    target.mkdir()
+    for i in range(20):
+        (target / f"f{i}").write_text("x")
+    (world_tmp / "alias").symlink_to(target)
+    result = iso.search_readable([(str(world_tmp), ["alias"])], {"n": b"needle-0123456789"}, link_max_files=3)
+    assert result["read"] == 3 and result["truncated"]
+
+
+@pytest.mark.parametrize("url", ["http://[::ffff:127.0.0.1]:18000", "http://[::ffff:7f00:1]:18000",
+                                 "http://[::ffff:10.0.0.5]:9000"])
+def test_ipv4_mapped_literals_are_refused(url):
+    """codex round 3 #5: such a URL reaches the IPv4 loopback listener but is not `is_loopback`."""
+    with pytest.raises(iso.IsolationError, match="use the IPv4 literal"):
+        iso.check_ip_url("SWITCH_URL", url)
+
+
+def test_local_non_loopback_endpoints_get_listener_checks(monkeypatch):
+    import ipaddress
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:  # no packet is sent
+        try:
+            probe.connect(("192.0.2.1", 9))
+            local = probe.getsockname()[0]
+        except OSError:
+            pytest.skip("no non-loopback IPv4 address here")
+    if ipaddress.ip_address(local).is_loopback:
+        pytest.skip("no non-loopback IPv4 address here")
+    assert iso.is_local_address(ipaddress.ip_address(local))
+    assert not iso.is_local_address(ipaddress.ip_address("192.0.2.1"))  # TEST-NET-1: never this host's
+    monkeypatch.setattr(iso, "_lookup", lambda fn, name: type("Pw", (), {"pw_uid": 5000})())
+    expected = iso._expected_listeners({"SWITCH_URL": "http://127.0.0.1:18000",
+                                        "PROXY_URL": f"http://{local}:19333", "LEGACY_URL": "http://192.0.2.1:19444"})
+    assert expected[19333][0] == "proxy" and 19444 not in expected
+
+
+def test_named_user_home_paths_are_refused_by_python_and_the_shell(tmp_path):
+    """codex round 3 #7: ~name/… is refused on both sides (bare ~ and ~/… stay), so they always agree."""
+    with pytest.raises(iso.IsolationError, match="~user paths are not supported"):
+        iso.repo_state_dir({"STRANGLER_STATE_DIR": "~root/state"})
+    with pytest.raises(iso.IsolationError, match="~user paths"):
+        iso._checkout_state_items({"MODERN_LISTS_PATH": "~root/lists.py"})
+    assert iso.repo_state_dir({"STRANGLER_STATE_DIR": "~/state"}) == Path(os.path.expanduser("~/state"))
+    harness = "\n".join(["set -euo pipefail", f"ROOT={shlex.quote(str(tmp_path))}",
+                         _function(ROOT / "scripts/targets.sh", "resolve_path"),
+                         'resolve_path "~/x" home', 'resolve_path rel', 'resolve_path "~root/x" home'])
+    proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 2 and "~user paths are not supported" in proc.stderr
+    assert proc.stdout.splitlines() == [os.path.expanduser("~/x"), f"{tmp_path}/rel"]
+    for script in ("agents.sh", "targets.sh"):
+        stub_env, _calls = _no_real_kills(tmp_path)
+        proc = subprocess.run(["bash", str(ROOT / "scripts" / script), "status"],
+                              env={**os.environ, **stub_env, "STRANGLER_STATE_DIR": "~root/state"},
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 2 and "~user paths are not supported" in proc.stderr, (script, proc.stderr)

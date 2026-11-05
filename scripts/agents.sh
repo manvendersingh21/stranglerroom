@@ -22,9 +22,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"
-case "$STATE" in  # as the Python side reads it: ~ expanded, relative to the checkout
+case "$STATE" in  # as the Python side reads it: ~ expanded, relative to the checkout; ~name/… refused by both
   "~") STATE="$HOME" ;;
   "~/"*) STATE="$HOME/${STATE#"~/"}" ;;
+  "~"*) echo "error: STRANGLER_STATE_DIR='$STATE': ~user paths are not supported; use an absolute path, ~/ or a" \
+             "path relative to the checkout" >&2; exit 2 ;;
 esac
 case "$STATE" in
   /*) ;;
@@ -51,8 +53,8 @@ case "$mode" in
     case "${1:-}" in
       stop|status)  # never leave agents running because the mode is unknown (e.g. a broken interpreter)
         MODE_UNKNOWN=1
-        echo "warning: cannot determine the isolation mode; ${1} acts on the tracked pids and on every sr-* agent" \
-             "user's processes" >&2 ;;
+        echo "warning: cannot determine the isolation mode; ${1} reads no pid file from the unvalidated run" \
+             "directory and acts on the agent service accounts' processes only" >&2 ;;
       *) echo "error: cannot determine the isolation mode (see above); refusing to start" >&2; exit 2 ;;
     esac ;;
 esac
@@ -117,18 +119,22 @@ isolated_pid() { # pid name
 }
 
 # Kill every process of service user <user> (e.g. a daemon a compromised agent
-# forked), repeating until none is left (at most 50 rounds); report survivors.
+# forked), repeating until none is left (at most 50 rounds, each waiting for the
+# exits); after a final inventory, fail (non-zero) naming survivors.
 # The service users are ${STRANGLER_SERVICE_USER_PREFIX:-sr-}<name>; the variable is a test seam (tests set a prefix
 # that names no real user, so not even an unstubbed pkill can reach a live deployment).
 kill_service_user() { # user
-  local _
+  local _ survivors
   id -u "$1" >/dev/null 2>&1 || return 0
   for _ in $(seq 1 50); do
     pgrep -u "$1" >/dev/null 2>&1 || return 0
     pkill -KILL -u "$1" 2>/dev/null || true
     sleep 0.1
   done
-  echo "warning: processes of $1 survive repeated KILL: $(pgrep -u "$1" | tr '\n' ' ')" >&2
+  survivors="$(pgrep -u "$1" 2>/dev/null | tr '\n' ' ')" || true
+  [ -n "${survivors// /}" ] || return 0
+  echo "error: processes of $1 survive repeated KILL: $survivors" >&2
+  return 1
 }
 
 # Echo the live PID for <name> if (and only if) it belongs to our agent module.
@@ -204,8 +210,17 @@ start_one() {
 
 # Stop all agents: TERM every live one, wait up to 5 s in total, KILL survivors,
 # then remove every PID file. Idempotent; never signals a pid that is not ours.
+# Isolated, the agents' service accounts are swept too, and any survivor makes it
+# fail (every agent is still attempted). Mode unknown: the run directory was not
+# validated, so no pid file is read or removed there; only the accounts are swept.
 stop_all() {
-  local name pid module deadline survivors=()
+  local name pid module deadline survivors=() rc=0
+  if [ -n "${MODE_UNKNOWN:-}" ]; then
+    for name in "${AGENT_NAMES[@]}"; do
+      kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name" || rc=1
+    done
+    return "$rc"
+  fi
   for name in "${AGENT_NAMES[@]}"; do
     pid="$(agent_pid "$name")"
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
@@ -222,10 +237,11 @@ stop_all() {
   for name in "${AGENT_NAMES[@]}"; do
     pid="$(agent_pid "$name")"
     [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
-    # Isolated (or mode unknown): whatever else runs as sr-<name> goes too.
-    if [ -n "${ISOLATE:-}${MODE_UNKNOWN:-}" ]; then kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name"; fi
+    # Isolated: whatever else runs as sr-<name> goes too.
+    if [ -n "${ISOLATE:-}" ]; then kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name" || rc=1; fi
     rm -f "$(pid_file "$name")"
   done
+  return "$rc"
 }
 
 # Isolated, an agent counts as running isolated only by the checks start applies.
@@ -263,18 +279,26 @@ case "${1:-}" in
     ;;
   stop)
     lock
-    stop_all
+    if ! stop_all; then echo "error: agent service processes survived the stop (see above)" >&2; exit 1; fi
     ;;
   restart)
     lock
-    stop_all
+    if ! stop_all; then
+      echo "error: agent service processes survived the stop (see above); not restarting" >&2
+      exit 1
+    fi
     for name in "${AGENT_NAMES[@]}"; do
       start_one "$name"
     done
     ;;
   status)
     for name in "${AGENT_NAMES[@]}"; do
-      status_one "$name"
+      if [ -n "$MODE_UNKNOWN" ]; then  # no pid file is read from the unvalidated run directory
+        user="${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name"
+        echo "$name: isolation mode unknown; processes of $user: $(pgrep -u "$user" 2>/dev/null | tr '\n' ' ')"
+      else
+        status_one "$name"
+      fi
     done
     ;;
   *)

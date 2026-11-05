@@ -24,8 +24,13 @@ PY="${PYTHON:-$ROOT/.venv/bin/python}"
 
 # A path override the way the Python processes read it: relative ones against $ROOT (their working directory), and
 # with "home", a leading ~ expanded (they expanduser STRANGLER_STATE_DIR and ROUTER_STATE_FILE, not MODERN_LISTS_PATH).
+# ~name/… is refused (the Python side refuses it too), so both always agree.
 resolve_path() { # path [home]
   local p="$1"
+  case "$p" in
+    "~"[!/]*) echo "error: '$p': ~user paths are not supported; use an absolute path, ~/ or a path relative to" \
+                   "the checkout" >&2; return 2 ;;
+  esac
   if [ "${2:-}" = home ]; then
     case "$p" in "~") p="$HOME" ;; "~/"*) p="$HOME/${p#"~/"}" ;; esac
   fi
@@ -46,8 +51,8 @@ case "$mode" in
     case "${1:-start}" in
       stop|status)  # never leave components running because the mode is unknown (e.g. a broken interpreter)
         MODE_UNKNOWN=1
-        echo "warning: cannot determine the isolation mode; ${1} acts on the tracked pids and on every sr-* user's" \
-             "processes" >&2 ;;
+        echo "warning: cannot determine the isolation mode; ${1} reads no pid file from the unvalidated run" \
+             "directory and acts on the service accounts' processes only" >&2 ;;
       *) echo "error: cannot determine the isolation mode (see above); refusing to start" >&2; exit 2 ;;
     esac ;;
 esac
@@ -95,18 +100,28 @@ isolated_listener() { # port name
 }
 
 # Kill every process of service user <user> (e.g. a daemon a compromised component forked), repeating until none is
-# left (at most 50 rounds); report any survivor.
+# left (at most 50 rounds, each waiting for the exits); after a final inventory, fail (non-zero) naming survivors.
 # The service users are ${STRANGLER_SERVICE_USER_PREFIX:-sr-}<name>; the variable is a test seam (tests set a prefix
 # that names no real user, so not even an unstubbed pkill can reach a live deployment).
 kill_service_user() { # user
-  local _
+  local _ survivors
   id -u "$1" >/dev/null 2>&1 || return 0
   for _ in $(seq 1 50); do
     pgrep -u "$1" >/dev/null 2>&1 || return 0
     pkill -KILL -u "$1" 2>/dev/null || true
     sleep 0.1
   done
-  echo "warning: processes of $1 survive repeated KILL: $(pgrep -u "$1" | tr '\n' ' ')" >&2
+  survivors="$(pgrep -u "$1" 2>/dev/null | tr '\n' ' ')" || true
+  [ -n "${survivors// /}" ] || return 0
+  echo "error: processes of $1 survive repeated KILL: $survivors" >&2
+  return 1
+}
+
+# Kill the processes of the service accounts of the given targets (no pid file involved); fail if any survive.
+sweep_service_users() { # name...
+  local name rc=0
+  for name in "$@"; do kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name" || rc=1; done
+  return "$rc"
 }
 
 # True if something accepts TCP connections on 127.0.0.1:<port>.
@@ -168,7 +183,7 @@ svc() { # name module port health
 # Stop the target recorded in <name>.pid if it is still ours: TERM it (and uvicorn's reload worker), wait up to
 # 5 s, then KILL. A stale pid file is reported and removed, never acted on.
 stop_one() { # name module port
-  local name="$1" module="$2" port="$3" pid
+  local name="$1" module="$2" port="$3" pid rc=0
   pid="$(cat "$RUN/$name.pid" 2>/dev/null || true)"
   if is_target_pid "$pid" "$module" "$port"; then
     pkill -TERM -P "$pid" 2>/dev/null || true   # uvicorn --reload spawns a child worker
@@ -183,9 +198,10 @@ stop_one() { # name module port
   elif [ -n "$pid" ]; then
     echo "  $name: stale pid file ($pid is not a running $module --port $port) — not signalling it" >&2
   fi
-  # Isolated (or mode unknown): whatever else runs as sr-<name> goes too.
-  if [ -n "${ISOLATE:-}${MODE_UNKNOWN:-}" ]; then kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name"; fi
+  # Isolated: whatever else runs as sr-<name> goes too; survivors make stop fail.
+  if [ -n "${ISOLATE:-}" ]; then kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name" || rc=1; fi
   rm -f "$RUN/$name.pid"
+  return "$rc"
 }
 
 # --fresh: remove what the processes actually use (overrides resolved the way they resolve them), and, isolated, the
@@ -213,10 +229,18 @@ target_status() { # name module port path
   fi
 }
 
+# Stop every target, attempting all of them; fail if any service process survived. Mode unknown: the run directory
+# was not validated, so no pid file is read there; only the service accounts are swept.
 stop() {
-  stop_one proxy targets.proxy.router 9000
-  stop_one modern targets.modern_fastapi.server 9002
-  stop_one legacy targets.legacy_openlibrary.server 9001
+  local rc=0
+  if [ -n "${MODE_UNKNOWN:-}" ]; then
+    sweep_service_users proxy modern legacy || rc=1
+    return "$rc"
+  fi
+  stop_one proxy targets.proxy.router 9000 || rc=1
+  stop_one modern targets.modern_fastapi.server 9002 || rc=1
+  stop_one legacy targets.legacy_openlibrary.server 9001 || rc=1
+  return "$rc"
 }
 
 # Fail (non-zero) naming every port that still accepts connections.
@@ -245,7 +269,10 @@ case "${1:-start}" in
   start)
     lock
     if [ "${2:-}" = "--fresh" ]; then
-      stop
+      if ! stop; then
+        echo "error: service processes survived the stop (see above); not resetting state nor starting" >&2
+        exit 1
+      fi
       ports_free 9000 9001 9002
       fresh_reset
     fi
@@ -254,7 +281,10 @@ case "${1:-start}" in
     svc modern targets.modern_fastapi.server 9002 /health
     svc proxy targets.proxy.router 9000 /_router/status
     ;;
-  stop) lock; stop; echo "targets stopped" ;;  # mode unknown: stop_one also kills every sr-<target> process
+  stop)
+    lock
+    if ! stop; then echo "error: service processes survived the stop (see above)" >&2; exit 1; fi
+    echo "targets stopped" ;;
   status)
     target_status legacy targets.legacy_openlibrary.server 9001 /health
     target_status modern targets.modern_fastapi.server 9002 /_meta
