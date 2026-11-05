@@ -71,10 +71,11 @@ gen_secrets() { # env-file label
 prepare_env() { # mode
   local mode="$1"
   if [ ! -f "$INFRA/.env" ]; then
-    cp "$INFRA/.env.example" "$INFRA/.env"
-    gen_secrets "$INFRA/.env" local
+    (umask 077; cp "$INFRA/.env.example" "$INFRA/.env")  # 0600 before any secret is written into it
+    gen_secrets "$INFRA/.env" local                     # sed -i keeps the file's mode
     log "generated .env with fresh secrets"
   fi
+  chmod 600 "$INFRA/.env"  # also tightens a .env from an older bootstrap: it holds the DB and admin secrets
   sed -i "s|^SWITCH_VERSION=.*|SWITCH_VERSION=${SWITCH_VERSION}|" "$INFRA/.env"
   sed -i "s|^MATTERMOST_HOST_PORT=.*|MATTERMOST_HOST_PORT=${MM_PORT}|" "$INFRA/.env"
   if [ "$mode" = docker ]; then
@@ -89,6 +90,8 @@ prepare_env() { # mode
 
 write_state_env() {
   set -a; . "$INFRA/.env"; set +a
+  mkdir -p "$STATE"
+  touch "$STATE/switch.env" && chmod 600 "$STATE/switch.env"  # 0600 before the secrets are written
   cat >"$STATE/switch.env" <<EOF
 SWITCH_URL=http://localhost:${API_PORT}
 MATTERMOST_URL=http://localhost:${MM_PORT}
