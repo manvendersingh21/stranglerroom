@@ -912,6 +912,23 @@ REMOVE_MAX_SECONDS = 1800.0
 REMOVE_BATCH = 1024
 
 
+def descriptor_budget() -> int:
+    """The soft RLIMIT_NOFILE, first raised to the hard limit (at most 65536). The fd-based walkers hold one descriptor
+    per level, and a caller's low soft limit (e.g. 1024 under sudo) must not shrink their depth caps needlessly; the
+    caps (a quarter of the result) still keep them clear of exhaustion."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = 65536 if hard == resource.RLIM_INFINITY else min(hard, 65536)
+    if soft != resource.RLIM_INFINITY and soft < target:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft = target
+        except (ValueError, OSError):
+            pass
+    return 1 << 20 if soft == resource.RLIM_INFINITY else soft
+
+
 def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str], *, max_entries: int | None = None,
                    max_seconds: float | None = None) -> None:
     """Remove ``name`` (an entry of ``dir_fd``) and, if it is a directory, everything below it, iteratively with an
@@ -922,7 +939,6 @@ def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str], *, ma
     budgets (REMOVE_MAX_ENTRIES, REMOVE_MAX_SECONDS) and a depth below the descriptor limit stop the removal with an
     error. A failure is recorded in ``errors`` (one line per entry) and the removal goes on with the rest; held
     descriptors are closed however it ends."""
-    import resource
 
     try:
         st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -937,8 +953,7 @@ def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str], *, ma
         except OSError as exc:
             errors.append(f"{label}: {exc}")
         return
-    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    soft = 1 << 20 if soft == resource.RLIM_INFINITY else soft
+    soft = descriptor_budget()
     depth_limit = max(1, min(4096, soft // 4))
     entries_left = REMOVE_MAX_ENTRIES if max_entries is None else max_entries
     deadline = time.monotonic() + (REMOVE_MAX_SECONDS if max_seconds is None else max_seconds)
@@ -2216,11 +2231,9 @@ def scan_candidates(roots: Iterable[str | Path], *, problems: list[str] | None =
     ``problems`` (verify fails on it): a budget or the depth cap reached, or any listing or open failure inside an
     existing tree (EMFILE included). A root that does not exist is fine; an entry vanishing mid-walk is ignored. Root
     only lists names here; it never opens a candidate nor resolves a link (only the dropped child does)."""
-    import resource
 
     problems = [] if problems is None else problems
-    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    soft = 1 << 20 if soft == resource.RLIM_INFINITY else soft
+    soft = descriptor_budget()
     depth_limit = max(1, min(SCAN_MAX_DEPTH if max_depth is None else max_depth, 256, soft // 4))
     budget = {"entries": SCAN_MAX_ENTRIES if max_entries is None else max_entries,
               "dirs": SCAN_MAX_DIRS if max_dirs is None else max_dirs}

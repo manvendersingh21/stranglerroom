@@ -36,7 +36,14 @@ jobs:
       # them as root on this clean runner (no sr-* users, no marker): they use temporary fixtures only.
       - name: Isolation tests as root
         timeout-minutes: 8
-        run: sudo -E .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_isolation.py tests/test_state_layout.py
+        run: |
+          # The mirrored venv's interpreter must sit on a path only root can modify (docs/ISOLATION.md §2.2). On this
+          # throwaway runner the tool cache belongs to `runner` and /opt is group-writable: hand that chain to root.
+          sudo chown root:root /opt /opt/hostedtoolcache /opt/hostedtoolcache/Python "$(dirname "$pythonLocation")"
+          sudo chmod go-w /opt /opt/hostedtoolcache /opt/hostedtoolcache/Python "$(dirname "$pythonLocation")"
+          sudo chown -R root:root "$pythonLocation"
+          sudo chmod -R go-w "$pythonLocation"
+          sudo -E .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_isolation.py tests/test_state_layout.py
 
   e2e:
     needs: unit

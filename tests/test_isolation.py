@@ -2100,7 +2100,15 @@ def test_large_files_are_streamed_with_overlap_not_skipped(world_tmp):
 
 
 @requires_root
-def test_remove_tree_is_iterative_safe_and_keeps_going(world_tmp, monkeypatch):
+def test_remove_tree_is_iterative_safe_and_keeps_going(world_tmp, monkeypatch, request):
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    request.addfinalizer(lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard)))
+    if (65536 if hard == resource.RLIM_INFINITY else min(hard, 65536)) // 4 < 1300:
+        pytest.skip(f"the hard RLIMIT_NOFILE ({hard}) cannot hold a 1200-level walk")
+    # a low soft limit, as under `sudo` in CI: the remover raises it to the hard limit itself (descriptor_budget)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
     victim = world_tmp / "victim"
     victim.mkdir()
     fd = os.open(victim, os.O_RDONLY | os.O_DIRECTORY)
@@ -2522,7 +2530,8 @@ def test_scan_depth_stays_below_the_descriptor_limit(world_tmp):
     def child():
         import resource
 
-        resource.setrlimit(resource.RLIMIT_NOFILE, (40, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+        # soft AND hard limit 40: descriptor_budget() cannot raise it, so the cap must be 40 // 4 = 10
+        resource.setrlimit(resource.RLIMIT_NOFILE, (40, 40))
         problems: list[str] = []
         iso.scan_candidates([str(deep)], problems=problems)
         return problems
