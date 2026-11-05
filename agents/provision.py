@@ -151,7 +151,22 @@ def main(argv: list[str] | None = None) -> int:
     creds = ensure_agents(settings)
     info = ensure_room(settings, creds, fresh=args.fresh_room)
     print(json.dumps(asdict(info), indent=2))
+    _isolation_note()
     return 0
+
+
+def _isolation_note() -> None:
+    """With per-component OS users (docs/ISOLATION.md), each running agent reads its own copy of room.json and of its
+    API key in the service area; the launcher refreshes those copies at every (re)start, not here."""
+    try:
+        from agents.isolation import isolation_on
+
+        on = isolation_on()
+    except Exception:  # noqa: BLE001 - advisory only: provisioning never depends on the isolation mode
+        return
+    if on:
+        log.warning("isolation is on: running agents keep their previous copies of room.json and their API keys until "
+                    "`bash scripts/agents.sh restart` (as root) re-copies them into the service area")
 
 
 if __name__ == "__main__":
