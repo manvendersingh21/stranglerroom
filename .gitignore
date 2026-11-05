@@ -11,3 +11,4 @@
 .venv/
 __pycache__/
 targets/modern_fastapi/app/lists.py
+.claude/

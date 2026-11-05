@@ -58,7 +58,7 @@ HACP_DIR = ROOT / ".hacp"
 PROTOCOL = "HACP/2.0"
 REQUESTER = "urn:hacp:agent:claude-orchestrator"
 AGY_READONLY = ("ls", "cat", "grep", "head", "tail", "wc", "mkdir", "pwd", "find", "diff")
-EXCLUDE_TOP = {".venv", ".switch-infra", ".native", ".state", ".hacp", ".git", ".hypothesis",
+EXCLUDE_TOP = {".venv", ".switch-infra", ".native", ".state", ".hacp", ".git", ".hypothesis", ".claude",
                ".pytest_cache", "node_modules"}
 QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|exceeded your current quota|"
                       r"hit your usage limit|usage limit reached", re.I)
