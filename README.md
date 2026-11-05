@@ -86,7 +86,7 @@ All targets bind `127.0.0.1`. The proxy's routing state is kept in `.state/proxy
 | Switch feature | What StranglerRoom uses it for |
 |---|---|
 | **Shared room** `strangler-migration` | Three independent agent processes and one human share a single conversation. Agents hand work to each other with targeted `@mentions` (`send_targeted`), with no orchestrator between them. In `make demo` the driver plays the human: it posts the human's three commands as `user` and checks the results. |
-| **Creator-only room documents** | Each document has exactly one *agent* writer: Switch answers 403 when an agent other than the creator calls `update_room_document`. Other agents can only read it (the `load_internal_documents` op) and mirror it with a sha256 evidence digest. So nothing authenticated as the fuzzer can rewrite the translator's ledger. The proxy's flip endpoint needs a token that has no public default: `ROUTER_ADMIN_TOKEN` if you set one, otherwise a random per-deployment token generated on first use in `.state/router.token` (mode 600; `ROUTER_TOKEN_FILE` or `STRANGLER_STATE_DIR` move it) and resolved by one shared rule in both the proxy and the cutover gate. The governance gate protects the Switch command path. By default every process runs as the operator, so a local process that can read `.state/` could still call `/_router/flip` directly or read the agents' credentials; `make isolate` runs each component as its own Unix user so that none of them can (§8). |
+| **Creator-only room documents** | Each document has exactly one *agent* writer: Switch answers 403 when an agent other than the creator calls `update_room_document`. Other agents can only read it (the `load_internal_documents` op) and mirror it with a sha256 evidence digest. So nothing authenticated as the fuzzer can rewrite the translator's ledger. The proxy's flip endpoint needs a token that has no public default: `ROUTER_ADMIN_TOKEN` if you set one, otherwise a random per-deployment token generated on first use in `.state/router.token` (mode 600; `ROUTER_TOKEN_FILE` or `STRANGLER_STATE_DIR` move it) and resolved by one shared rule in both the proxy and the cutover gate. The governance gate protects the Switch command path. By default every process runs as the operator, so a local process that can read `.state/` could still call `/_router/flip` directly or read the agents' credentials; `make isolate` runs each component as its own Unix user, so that none of them can read `.state/` or another agent's key, and only the proxy and the cutover gate (which receive the router token in their environment) can call `/_router/flip` (§8). |
 | **Hash-chained ledger** | Every trail entry stores `prev` and `hash = sha256(canonical(entry))` (`agents/ledger.py`, `verify_chain`). Sealing writes `sealed = {at, head_hash, entries}`. The driver re-verifies the chain through the Gateway, as admin and independently of the agents. The hashes are unkeyed, so tamper evidence comes from the head hash also being posted in the channel: a later rewrite of the document, for example by a Gateway admin, would no longer match it. |
 | **Addressing-policy unlock** | Bootstrap-registered agents are owned by a non-admin user, so by default Switch refuses messages from the human. `agents/provision.py` clears each agent's policy as Gateway admin (`PUT /gateway/agents/{id}/addressing-policy {"policy": null}`). |
 | **Human-only governance gate** | `migrate`, `preserve/deprecate`, `approve-cutover` and `rollback` are refused unless the sender is the room's human lead: a participant whose `type`, as Switch reports it, is `user` and whose name is `RoomInfo.human` (`RoomAgent.classify`; other people who join the bridged channel are `guest`s, and names that collide after case folding are refused). Nothing in the message text can change that. Build changes and routing changes are mutually exclusive: the translator holds a cross-process production lock (`agents/locks.py`, an `flock`) for a whole `migrate`/decision and the cutover gate for a whole `approve-cutover`/`rollback`, so production can never be flipped onto a build that is being replaced. Stale or replayed commands are refused too: an approval older than the latest benchmark or router flip, a rollback older than the latest flip, and a migrate/decision message older than the current migration's request never act. The demo proves this live: it posts `@cutover-gate approve-cutover` *as the fuzzer agent* (`POST /agents/{id}/message`) and asserts `🛑 Governance gate` with the proxy still on legacy. |
@@ -270,7 +270,7 @@ make demo      # switch-up → targets.sh start --fresh → provision → agents
 | `make cinema` | `.venv/bin/python scripts/run_e2e_demo.py --cinema --fresh` |
 | `make test` / `test-integration` | `pytest -m 'not integration'` / `pytest -m integration` |
 | `make stop` | stop agents, targets and Switch (native mode stops only the servers `switch-up` started and recorded in `.native/*.pid`; it leaves Postgres up rather than pull it from under an untracked server) |
-| `make clean-state` | stop agents and targets, then wipe `.state/` except `switch.env` and `connection.env` (agent credentials included, so the next `make provision` re-registers them), and empty `/srv/stranglerroom/state` if the service area exists |
+| `make clean-state` | stop agents and targets, then wipe `.state/` except `switch.env` and `connection.env` (agent credentials included, so the next `make provision` re-registers them), and, when run as root, empty the service area's `state/` (`/srv/stranglerroom/state` by default, or the marker's service home) if it exists; as a normal user it leaves the service area alone |
 | `make isolate` / `isolate-verify` / `isolate-off` | run every component as its own Unix user from `/srv/stranglerroom` / prove it / turn it off (§8) |
 
 ### Recording mode (`make cinema`)
@@ -349,31 +349,42 @@ on isolation for this checkout ([docs/ISOLATION.md](docs/ISOLATION.md)):
 
 * six system users (`sr-translator`, `sr-fuzzer`, `sr-cutover-gate`, `sr-proxy`, `sr-legacy`, `sr-modern`) and a group
   `sr-prodlock` shared by the translator and the gate for the production lock;
-* a root-owned service area `/srv/stranglerroom`: a mirror of the code and the virtualenv, plus a state directory in which
-  each component owns only its private directory, and each agent gets a copy of its own API key (0600, owned by it) and
-  of `room.json`. The router token reaches only the proxy and the gate, through their environment;
-* `/root`, the checkout and its `.state/` keep their permissions (0700), so no service user can reach `switch.env`, the
-  router token, the master copies of the keys or the logs.
+* a root-owned service area `/srv/stranglerroom` holds:
+  * a mirror of the code and the virtualenv;
+  * a state directory in which each component owns only its private directory (0700). The translator also owns
+    `module/` (0755), which holds the generated module the modern server serves;
+  * a copy of each agent's own API key (`state/agents/<name>.json`, 0600, owned by it) and one shared, read-only
+    copy of `room.json` (root, 0644).
+
+  The router token reaches only the proxy and the gate, through their environment;
+* `/root`, the checkout and its `.state/` keep their permissions (setup changes none of them). `/root` is 0700, so no
+  service user can reach the checkout below it: `switch.env`, the router token, the master copies of the keys and
+  the logs are all out of reach.
 
 From then on `scripts/agents.sh` and `scripts/targets.sh` (and therefore `make demo`) launch each process through
 `python -m agents.isolation exec`. It refreshes the mirrors, gives the component a new session, closes every inherited
 descriptor, drops to the component's user and `exec`s it, with an environment built from that component's own
 allow-list. `make isolate-verify` proves it: as each service user it attempts every access in the matrix of
-docs/ISOLATION.md §6 (the kernel decides), imports the component's module, scans every file that user can reach for
-every secret value, and checks the live processes' uids, sessions and environments. `make isolate-off` turns it off
-(`--purge` also removes the users and `/srv/stranglerroom`). CI runs as a non-root user without the marker, so
-isolation stays off there.
+docs/ISOLATION.md §6 (the kernel decides), imports the component's module, and checks the live processes' uids,
+sessions and environments. It also scans every file that user can reach under the service area and the scan roots
+(`/srv`, `/tmp`, `/var/tmp`, `/dev/shm`, `/etc`, `/home`, `/opt`, `/var/log`, `/var/lib/stranglerroom`, `/root`) for
+every secret value of at least 8 characters.
+
+`make isolate-off` turns isolation off: it removes the marker and the agents' API-key copies.
+`python -m agents.isolation disable --purge` also removes `/srv/stranglerroom`, the six users, their groups and
+`sr-prodlock`. CI forces `STRANGLER_ISOLATION=off`, and the runner has no marker, so isolation stays off there. That
+includes the unit job's step that runs the isolation tests as root against temporary fixtures.
 
 On the dev box (Switch 0.31.0 native), after `make isolate`, the live e2e ran with all six components as their own users:
-`run_e2e_demo.py --fresh` passed 35/35, three times, after each review round. The final `make isolate-verify` with the
+`run_e2e_demo.py --fresh` passed 35/35 in three runs, on the round-2 code right after `make isolate`, then after review round 3, then after rounds 3b/3c. The final `make isolate-verify` with the
 stack running: 315 checks, 313 PASS and 0 FAIL. The 2 SKIPs are LLM mode being off and Mattermost's built-in
 placeholder database password, which is too short to search for. The 313 cover:
 * 195 access probes run as each user, and 30 refused cross-component signals;
 * every component process's uids, groups, session and environment, and the owner of every listener on the Switch and
   target ports in both address families;
 * six smoke imports;
-* a complete secret scan: 4,312 world-readable files (6.5 GB, including other projects' tarballs and CUDA libraries on
-  this VM) searched once, plus each user's own reachable files.
+* a secret scan that covered all its roots, with no budget hit: 4,312 world-readable files (6.5 GB, including other
+  projects' tarballs and CUDA libraries on this VM) searched once, plus each user's own reachable files.
 
 The live negative checks also held:
 * `setup` and `disable` refuse while components run;
@@ -463,11 +474,11 @@ make isolate-verify     # (isolated hosts) live isolation proof              →
 
 | Layer | Count | What |
 |---|---|---|
-| Unit (no live Switch) | **1,023** in 28 files: the template-engine tests skip without `.switch-infra/core/.venv`; two isolation tests need a host without the `sr-*` users, so they skip on the isolated dev box. CI's `unit` job runs `make test` as its non-root user, then the isolation tests again as root on a clean runner, which covers the launcher's root-only paths | per-component isolation (212: launcher, privilege drop, mirrors, setup/disable, verify, and the scripts' isolated paths, all against temporary fixtures, never the host), state layout and least privilege (21), targets contract and adversarial cases (71), codegen (277), divergence engine (24), the three agents (131, including fuzzer edge cases, governance/replay/history regressions and the production lock), driver logic (86), ops scripts (42), template (39 offline), CI workflow (13), … |
+| Unit (no live Switch) | **1,023** in 28 files: the template-engine tests skip without `.switch-infra/core/.venv`; two isolation tests need a host without the `sr-*` users, so they skip on the isolated dev box. CI's `unit` job runs `make test` as its non-root user, then the isolation tests again as root on a clean runner, which covers the launcher's root-only paths | per-component isolation (212: launcher, privilege drop, mirrors, setup/disable, verify, and the scripts' isolated paths, all against temporary fixtures, never the host), state layout and least privilege (21), targets contract and adversarial cases (71), codegen (277), divergence engine (24), the three agents (131, including fuzzer edge cases, governance/replay/history regressions and the production lock), driver logic (86), ops scripts (45), template (39 offline), CI workflow (13), … |
 | In-process end-to-end (part of the 1,023) | 3 | `test_agents_loop.py`: the three real agents in a `FakeRoom` against real target subprocesses, the full loop plus a restart and replay. `test_parity_integration.py`: D-1..D-5 → 5/5 plus a `deprecated-violated` negative control |
 | Live integration (`-m integration`) | **2** | `test_switch_integration.py::test_switch_client_end_to_end` (throwaway agents) and `test_template.py::test_live_validate_run_and_archive` |
-| Live end-to-end | **35 checks** | `scripts/run_e2e_demo.py` against the real stack. Runs 2–7 all exited 0 (run 1 exposed a `targets.sh` hang, since fixed). Then 2 × `--fresh` and 1 × `--cinema --fresh`, each 35/35. After the critic's governance hardening: `make demo` and `run_e2e_demo.py --fresh`, each 35/35. Final recorded `--cinema --fresh` run (§5): 35/35, followed by `--fresh` verification runs after the final hardening (per-deployment router token; paged approval lookup and stricter replay checks), each 35/35. With isolation on (every component as its own Unix user from `/srv/stranglerroom`): three `--fresh` runs, each 35/35, after the second and third review rounds |
-| Live isolation (`make isolate-verify`) | **315 checks** | The final run on the dev box, with the stack live: 313 PASS, 0 FAIL, 2 SKIP (LLM mode off; Mattermost's placeholder password, too short to search for). The 313 cover 195 access probes run as each user, 30 refused cross-component signals, process uids, sessions and environments, listener owners, smoke imports, and a complete secret scan: 6.5 GB of world-readable files searched once, plus each user's own reachable files |
+| Live end-to-end | **35 checks** | `scripts/run_e2e_demo.py` against the real stack. Runs 2–7 all exited 0 (run 1 exposed a `targets.sh` hang, since fixed). Then 2 × `--fresh` and 1 × `--cinema --fresh`, each 35/35. After the critic's governance hardening: `make demo` and `run_e2e_demo.py --fresh`, each 35/35. Final recorded `--cinema --fresh` run (§5): 35/35, followed by `--fresh` verification runs after the final hardening (per-deployment router token; paged approval lookup and stricter replay checks), each 35/35. With isolation on (every component as its own Unix user from `/srv/stranglerroom`): 35/35 in each of three runs, on the round-2 code right after `make isolate`, then after review round 3, then after rounds 3b/3c |
+| Live isolation (`make isolate-verify`) | **315 checks** | The final run on the dev box, with the stack live: 313 PASS, 0 FAIL, 2 SKIP (LLM mode off; Mattermost's placeholder password, too short to search for). The 313 cover 195 access probes run as each user, 30 refused cross-component signals, process uids, sessions and environments, listener owners, smoke imports, and a secret scan that covered all its roots: 6.5 GB of world-readable files searched once, plus each user's own reachable files |
 
 Test hygiene: tests that start the modern target point `MODERN_LISTS_PATH` at a tmp file, all ports come from
 `tests.procs.free_port()`, and unit tests never touch the live Switch. Spawned targets and the production lock use a

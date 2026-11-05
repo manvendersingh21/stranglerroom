@@ -15,8 +15,9 @@ read every secret on the host:
   Mattermost password**, so it can impersonate the human and issue the human-only verbs.
 
 Isolation runs every component as its own unprivileged Unix user, from a **service area** outside the operator's
-home (`/srv/stranglerroom`). The operator's checkout, its `.state/` and `/root` keep their current permissions (0700),
-so no service user can reach any of them. Each service receives a copy of exactly what it needs.
+home (`/srv/stranglerroom`). The operator's checkout, its `.state/` and `/root` keep their current permissions. `/root`
+is 0700, and because the checkout lies under it, no service user can reach any of them; `verify` checks this (a
+checkout outside a 0700 home would not be protected). Each service receives a copy of exactly what it needs.
 
 | component | Unix user | supplementary groups | receives | can write |
 |---|---|---|---|---|
@@ -48,7 +49,9 @@ forwarding.
 
 ### 2.1 The checkout's `.state/` (both modes; the operator's)
 
-Every file a component writes lives in that component's own directory. Paths honour `STRANGLER_STATE_DIR`.
+Each component's private state lives in its own directory. The shared exceptions are `production.lock` (translator
+and gate), `router.token` (generated at the state root by the proxy or the gate when unisolated) and the generated
+module (`MODERN_LISTS_PATH`, by default `targets/modern_fastapi/app/lists.py`). Paths honour `STRANGLER_STATE_DIR`.
 
 ```
 .state/  switch.env (0600)  connection.env (URLs only, 0644)  router.token  room.json  production.lock
@@ -78,10 +81,11 @@ Every file a component writes lives in that component's own directory. Paths hon
 
 Rules:
 
-* **Root never writes inside a service-owned directory.** No "ownership repair": a service-owned directory is created
-  empty by root and then belongs to its service. The only root operation inside one is a reset's `unlink` of known
-  names, through a directory descriptor opened with `O_DIRECTORY|O_NOFOLLOW` whose owner has been checked (unlink
-  never follows the final component).
+* **Root never creates or rewrites files inside a service-owned directory.** No "ownership repair": such a directory is
+  created empty by root and then belongs to its service; only its own mode is restored, through a no-follow
+  descriptor. Root deletes inside one in three cases. A reset unlinks known names through a checked
+  `O_DIRECTORY|O_NOFOLLOW` descriptor; unlink never follows the final component. `clean` and `disable --purge` delete
+  whole directories, after renaming them, with the descriptor-based remover.
 * Every directory root writes into (`app/`, `venv/`, `state/`, `state/agents/`) is root-owned and not writable by any
   service. Before writing, root checks that it is not a symlink and is owned by root.
 * The mirrors are refreshed by every isolated launch (only changed files; temp file plus rename), serialised by an
@@ -98,7 +102,10 @@ Rules:
   checkout never picks the marker up.
 * `on` without a ready marker for this checkout is an error, and so is a launch (`exec`) while isolation is on and the
   caller is not root. Isolation never silently falls back to off.
-* The test suite forces `off` (autouse fixture), so tests never drop privileges, sync mirrors or touch the host.
+* The test suite forces `off` (autouse fixture and session environment), so no script or launcher a test starts runs
+  isolated or sees the host's marker. The isolation unit tests exercise `drop_privileges`, `run_as` and
+  `sync_mirrors`/`prepare` directly, only in forked children and on temporary directories. The root-only ones are
+  skipped unless pytest runs as root, which CI does in a separate step.
 
 ## 4. Launcher: `python -m agents.isolation exec <component> -- <python> -m <module> [args…]`
 
@@ -111,14 +118,14 @@ nohup ${ISOLATE:+"$PY" -m agents.isolation exec "$name" --} "$PY" -m "$module" �
 
 With isolation off, nothing changes. With it on, the launcher, running as root:
 
-1. checks the marker and that `euid == 0`;
+1. checks the marker and that `euid == 0`, and validates and rewrites argv (step 3) before touching anything;
 2. refreshes the mirrors and prepares the component's part of the service area (§2.2): private dir, API key and
    `room.json` copies for agents, the production lock for translator and gate, the module dir (owned by the
    translator; also created when the modern server starts first, because it serves from that directory). The mode of
    a service-owned directory is restored through its no-follow descriptor, so a `chmod 0777` by its owner does not
    survive a relaunch. Mirrored files lose group/other write and set-id bits; a mirrored symlink must stay inside its
    tree or point at a path only root can modify;
-3. rewrites argv: `[<python>, "-m", <module>, …]` becomes `[SERVICE_HOME/venv/bin/python, "-m", <module>, …]`
+3. the argv rewrite: `[<python>, "-m", <module>, …]` becomes `[SERVICE_HOME/venv/bin/python, "-m", <module>, …]`
    (argv[0] is discarded), with cwd `SERVICE_HOME/app`. Any other argv shape is refused, and so is a module other than
    the component's own;
 4. builds the environment from **that component's** schema, not from a prefix wildcard:
@@ -145,13 +152,15 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
      `MODERN_LISTS_PATH=SERVICE_HOME/state/module/lists.py` (translator, modern), and `ROUTER_ADMIN_TOKEN`
      (proxy and cutover-gate only), whose value is `resolve_router_token()` evaluated as root, the rule both use
      unisolated;
-   * finally removed from every other component: `ROUTER_ADMIN_TOKEN`, `ROUTER_TOKEN_FILE`. A pass-through name
+   * finally removed: `ROUTER_ADMIN_TOKEN` from every other component, and `ROUTER_TOKEN_FILE` from every component
+     (proxy and gate included). A pass-through name
      can never set a launcher-set or forbidden variable;
 5. starts a new session (`setsid`; failure is an error), closes every inherited descriptor except 0, 1 and 2, sets
    the supplementary groups, gid and uid (real, effective and saved) with the process non-dumpable before and after
    the switch (so nothing of root's memory is readable while it still holds it; a host with `fs.suid_dumpable=1`,
-   where the kernel would make it dumpable in between, is refused), sets `no_new_privs`, checks that `setuid(0)` now
-   fails and that the permitted, effective and ambient capability sets are empty, joins a new session keyring (fail
+   where the kernel would make it dumpable in between, is refused), checks that `setuid(0)`, `setresuid(-1, 0, -1)`
+   and `setgid(0)` now fail and that the permitted, effective and ambient capability sets are empty, then sets
+   `no_new_privs`, joins a new session keyring (fail
    closed: the join must succeed, or the kernel must prove there is nothing to inherit with ENOKEY or EKEYREVOKED
    from `KEYCTL_GET_KEYRING_ID`, or a real ENOSYS on a known architecture; EPERM, EACCES and unknown architectures are
    errors), sets `umask 077`, changes to `SERVICE_HOME/app` and `execve`s the component. The recorded pid is
@@ -168,14 +177,17 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
   whose command line no longer holds `-m agents.isolation`; for a target, its user must also own the listening socket
   (`/proc/net/tcp`). A component found running as another uid, or a healthy port with no tracked isolated process, is
   an error naming the fix (`restart` or `stop`), never "already up". `status` applies the same acceptance
-  ("running (isolated)" or "running, NOT isolated — run restart"). A launch that does not come up isolated is
-  killed with its children, and `stop` repeats `pkill -u` for the service users until none of their processes is
+  ("running (isolated)" or "running, NOT isolated — run restart"). A launch that answers but is not running
+  isolated (and, for an agent, one that has not finished the isolated exec within 30 s) is killed with its children;
+  a target that never becomes healthy is reported as failed and left to `stop`. And `stop` repeats `pkill -u` for the service users until none of their processes is
   left. A sweep that ends with survivors fails: `stop` exits non-zero after trying every service, and `restart`,
   `start --fresh` and `reset` do not proceed. If the mode cannot be determined (e.g. a broken interpreter), `stop`
   and `status` still work, sweeping the fixed service accounts without reading pid files from the unvalidated run
   directory, while `start` fails closed.
-* Paths (`STRANGLER_STATE_DIR`, `ROUTER_STATE_FILE`, `MODERN_LISTS_PATH`) resolve the same way in the scripts and in
-  Python: relative to the checkout, and `~` or `~/…` to root's home. Named-user forms (`~name/…`) are refused.
+* `agents.sh`, `targets.sh` and `agents/isolation.py` resolve path overrides the same way: relative paths against the
+  checkout. `~` and `~/…` expand to the invoking user's home for `STRANGLER_STATE_DIR` and `ROUTER_STATE_FILE` only,
+  never for `MODERN_LISTS_PATH`, and named-user forms (`~name/…`) are refused. `bootstrap_switch.sh`,
+  `make clean-state` and `agents/switch_client.py` use `STRANGLER_STATE_DIR` as given: use an absolute path there.
 * `targets.sh start --fresh` with isolation on also runs `python -m agents.isolation reset`. This unlinks
   `proxy/router.json`, `fuzzer/divergence_registry.json` (and `.staging`) and `module/lists.py` in the service area.
 * `make clean-state` also runs `python -m agents.isolation clean`, whatever the mode, whenever a service area exists (so
@@ -184,8 +196,8 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
   (every directory opened `O_DIRECTORY|O_NOFOLLOW` relative to its parent and identity-checked; no recursion, so a
   deep tree a service built cannot crash it; `agents/` first; errors are reported per entry). As non-root it leaves
   the service area alone. `clean-state` keeps `switch.env` and `connection.env`.
-* The run directory must be root-owned and not group- or other-writable. The default `.state/run` under the 0700
-  checkout is out of every service's reach.
+* The run directory must be root-owned and not group- or other-writable. The default `.state/run` is out of every
+  service's reach: `mode --run-dir` makes it root-owned 0700, inside the checkout, under the 0700 `/root`.
 
 ## 5. Host setup and teardown (root)
 
@@ -201,8 +213,9 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
 * never changes the permissions of `/root`, the checkout or anything outside `SERVICE_HOME`, `/etc/passwd`,
   `/etc/group` and the marker.
 
-`python -m agents.isolation disable [--purge]` (`make isolate-off`) removes the marker; `--purge` also removes
-`SERVICE_HOME` and the users and group. Both refuse while a component is running.
+`python -m agents.isolation disable [--purge]` (`make isolate-off`) removes the marker and the agents' API-key copies
+in `SERVICE_HOME/state/agents`. `--purge` also removes `SERVICE_HOME`, the six users with their own groups, and
+`sr-prodlock`. Both refuse while a component is running, or when the marker belongs to another checkout.
 
 ## 6. Verification: `python -m agents.isolation verify` (`make isolate-verify`)
 
