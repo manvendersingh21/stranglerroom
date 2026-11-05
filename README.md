@@ -13,7 +13,7 @@ flip is written to single-writer Switch room documents and sealed in a hash-chai
 | Live result | **100% Approved Parity (5/5)** · 162 paired shadow probes per campaign (each sent to both targets) · p99 at concurrency 50: legacy 1283 ms → modern 71 ms · cutover approved by `user` · ledger sealed with 14 hash-chained entries |
 | Loop time | about 23 s for all 8 steps with `make e2e` (about 34 s wall clock with pre-flight); about 83 s with `make cinema` |
 | Stack | Switch 0.31.0 (core + Gateway) · Mattermost 11.9.0 · web.py 0.62 · FastAPI 0.115.12 · Python 3.12 |
-| Tests | 783 pytest tests (781 unit + 2 live integration) plus a 35-check live end-to-end driver |
+| Tests | 1,024 pytest tests (1,022 unit + 2 live integration), a 35-check live end-to-end driver, and `make isolate-verify` (315 live checks when isolated) |
 
 ---
 
@@ -364,10 +364,17 @@ every secret value, and checks the live processes' uids, sessions and environmen
 isolation stays off there.
 
 On the dev box (Switch 0.31.0 native), after `make isolate`, the live e2e ran with all six components as their own users:
-`run_e2e_demo.py --fresh` passed 35/35. `make isolate-verify` with the stack running: 320 checks, 318 PASS and 0 FAIL. The 2
-SKIPs are LLM mode being off and Mattermost's built-in placeholder database password, which is too short to search for.
-The 318 cover 195 access probes, 30 refused cross-component signals, the six smoke imports, and the secret scan of about
-3,100 readable files per user. The live negative checks also held:
+`run_e2e_demo.py --fresh` passed 35/35, three times, after each review round. The final `make isolate-verify` with the
+stack running: 315 checks, 313 PASS and 0 FAIL. The 2 SKIPs are LLM mode being off and Mattermost's built-in
+placeholder database password, which is too short to search for. The 313 cover:
+* 195 access probes run as each user, and 30 refused cross-component signals;
+* every component process's uids, groups, session and environment, and the owner of every listener on the Switch and
+  target ports in both address families;
+* six smoke imports;
+* a complete secret scan: 4,312 world-readable files (6.5 GB, including other projects' tarballs and CUDA libraries on
+  this VM) searched once, plus each user's own reachable files.
+
+The live negative checks also held:
 * `setup` and `disable` refuse while components run;
 * agents started unisolated are refused by `agents.sh start` and fail `isolate-verify`;
 * a `nobody`-owned `[::1]:18000` listener fails `isolate-verify`;
@@ -447,20 +454,25 @@ tests/                 pytest suite + FakeRoom (tests/fakes.py) with faithful Sw
 ## 11. Tests
 
 ```bash
-make test               # .venv/bin/python -m pytest -m 'not integration'   → 781 passed (~5 min on 4 CPUs)
+make test               # .venv/bin/python -m pytest -m 'not integration'   → 1020 passed, 2 skipped (~5.5 min on 4 CPUs)
 make test-integration   # live Switch + Mattermost                           → 2 passed
 make e2e                # live 8-step driver                                 → 35/35 checks
+make isolate-verify     # (isolated hosts) live isolation proof              → 313 passed, 0 failed, 2 skipped
 ```
 
 | Layer | Count | What |
 |---|---|---|
-| Unit (no live Switch) | **781** in 26 files (the template-engine tests skip without `.switch-infra/core/.venv`) | targets contract and adversarial cases (71), codegen (277), divergence engine (24), the three agents (131, including fuzzer edge cases, governance/replay/history regressions and the production lock), driver logic (86), ops scripts (42), template (39 offline), CI workflow (12), … |
-| In-process end-to-end (part of the 781) | 3 | `test_agents_loop.py`: the three real agents in a `FakeRoom` against real target subprocesses, the full loop plus a restart and replay. `test_parity_integration.py`: D-1..D-5 → 5/5 plus a `deprecated-violated` negative control |
+| Unit (no live Switch) | **1,022** in 28 files: the template-engine tests skip without `.switch-infra/core/.venv`, and two isolation tests need a host without the `sr-*` users, so they skip on the isolated dev box and run in CI | per-component isolation (212: launcher, privilege drop, mirrors, setup/disable, verify, and the scripts' isolated paths, all against temporary fixtures, never the host), state layout and least privilege (21), targets contract and adversarial cases (71), codegen (277), divergence engine (24), the three agents (131, including fuzzer edge cases, governance/replay/history regressions and the production lock), driver logic (86), ops scripts (42), template (39 offline), CI workflow (12), … |
+| In-process end-to-end (part of the 1,022) | 3 | `test_agents_loop.py`: the three real agents in a `FakeRoom` against real target subprocesses, the full loop plus a restart and replay. `test_parity_integration.py`: D-1..D-5 → 5/5 plus a `deprecated-violated` negative control |
 | Live integration (`-m integration`) | **2** | `test_switch_integration.py::test_switch_client_end_to_end` (throwaway agents) and `test_template.py::test_live_validate_run_and_archive` |
-| Live end-to-end | **35 checks** | `scripts/run_e2e_demo.py` against the real stack. Runs 2–7 all exited 0 (run 1 exposed a `targets.sh` hang, since fixed). Then 2 × `--fresh` and 1 × `--cinema --fresh`, each 35/35. After the critic's governance hardening: `make demo` and `run_e2e_demo.py --fresh`, each 35/35. Final recorded `--cinema --fresh` run (§5): 35/35, followed by `--fresh` verification runs after the final hardening (per-deployment router token; paged approval lookup and stricter replay checks), each 35/35 |
+| Live end-to-end | **35 checks** | `scripts/run_e2e_demo.py` against the real stack. Runs 2–7 all exited 0 (run 1 exposed a `targets.sh` hang, since fixed). Then 2 × `--fresh` and 1 × `--cinema --fresh`, each 35/35. After the critic's governance hardening: `make demo` and `run_e2e_demo.py --fresh`, each 35/35. Final recorded `--cinema --fresh` run (§5): 35/35, followed by `--fresh` verification runs after the final hardening (per-deployment router token; paged approval lookup and stricter replay checks), each 35/35. With isolation on (every component as its own Unix user from `/srv/stranglerroom`): three `--fresh` runs, each 35/35, after the second and third review rounds |
+| Live isolation (`make isolate-verify`) | **315 checks** | The final run on the dev box, with the stack live: 313 PASS, 0 FAIL, 2 SKIP (LLM mode off; Mattermost's placeholder password, too short to search for). The 313 cover 195 access probes run as each user, 30 refused cross-component signals, process uids, sessions and environments, listener owners, smoke imports, and a complete secret scan: 6.5 GB of world-readable files searched once, plus each user's own reachable files |
 
 Test hygiene: tests that start the modern target point `MODERN_LISTS_PATH` at a tmp file, all ports come from
-`tests.procs.free_port()`, and unit tests never touch the live Switch.
+`tests.procs.free_port()`, and unit tests never touch the live Switch. Spawned targets and the production lock use a
+per-session temp dir, so the real `.state` is never written. Tests that drive the scripts' isolated paths stub process
+control and use a test-only user prefix. The session fails if `/etc/stranglerroom`, the real API-key copies, or any
+live `sr-*` process changed while it ran.
 
 ## 12. The HACP peer swarm
 

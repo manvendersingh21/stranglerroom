@@ -122,18 +122,23 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
    (argv[0] is discarded), with cwd `SERVICE_HOME/app`. Any other argv shape is refused, and so is a module other than
    the component's own;
 4. builds the environment from **that component's** schema, not from a prefix wildcard:
-   * every component gets `PATH`, `LANG`, `LANGUAGE`, the 13 standard locale variables (`LC_ALL`, `LC_CTYPE`, … — an
+   * every component gets a fixed `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, keeping only
+     directories whose whole path only root can modify; on the dev box `/usr/local/bin` belongs to another user and is
+     dropped), never root's own; `LANG`, `LANGUAGE`, the 13 standard locale variables (`LC_ALL`, `LC_CTYPE`, … — an
      explicit list, not `LC_*`), `TZ`, `PYTHONUNBUFFERED`, `STRANGLER_LOG_LEVEL`;
    * agents get `STRANGLER_AGENT_PACE`, `LEGACY_URL`, `MODERN_URL`, `PROXY_URL`, and `SWITCH_URL` (from the
      environment, else the checkout's public `connection.env`, else the default; never `switch.env`);
-   * the translator also gets `STRANGLER_TRANSLATOR_MODE`, `STRANGLER_LLM_CMD`, and the variables named in
+   * the translator also gets `STRANGLER_TRANSLATOR_MODE`, `STRANGLER_LLM_CMD` (in LLM mode its first word is resolved
+     on that `PATH`, checked, and pinned to the absolute path), and the variables named in
      `STRANGLER_TRANSLATOR_PASS_ENV` (comma-separated, for LLM credentials). Naming `LD_*`, `PYTHON*`,
      `STRANGLER_ISOLATION*` or any `switch.env`/Switch `.env` secret there is an error, not a silent skip;
    * the proxy gets `LEGACY_URL` and `MODERN_URL`;
    * the modern server gets `MODERN_NO_RELOAD`;
    * `SWITCH_URL`, `PROXY_URL`, `LEGACY_URL` and `MODERN_URL` must name an IP literal: `localhost` (which may
      resolve to `::1`, where any local user can bind a port Switch or a target leaves free) and other names are
-     refused;
+     refused, and so are unspecified and IPv4-mapped addresses, backslashes, user info, queries and non-http(s)
+     schemes. The
+     component receives a canonical URL rebuilt from the parsed parts, never the original string;
    * set last by the launcher, overriding anything above: `STRANGLER_STATE_DIR=SERVICE_HOME/state`,
      `PYTHONPATH=SERVICE_HOME/app`, `PYTHONSAFEPATH=1`, `PYTHONDONTWRITEBYTECODE=1`, `HOME` (its private dir),
      `USER`/`LOGNAME`,
@@ -144,9 +149,12 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
      can never set a launcher-set or forbidden variable;
 5. starts a new session (`setsid`; failure is an error), closes every inherited descriptor except 0, 1 and 2, sets
    the supplementary groups, gid and uid (real, effective and saved) with the process non-dumpable before and after
-   the switch (so nothing of root's memory is readable while it still holds it), sets `no_new_privs`, checks that
-   `setuid(0)` now fails and that the permitted, effective and ambient capability sets are empty, joins a new session
-   keyring, sets `umask 077`, changes to `SERVICE_HOME/app` and `execve`s the component. The recorded pid is
+   the switch (so nothing of root's memory is readable while it still holds it; a host with `fs.suid_dumpable=1`,
+   where the kernel would make it dumpable in between, is refused), sets `no_new_privs`, checks that `setuid(0)` now
+   fails and that the permitted, effective and ambient capability sets are empty, joins a new session keyring (fail
+   closed: the join must succeed, or the kernel must prove there is nothing to inherit with ENOKEY or EKEYREVOKED
+   from `KEYCTL_GET_KEYRING_ID`, or a real ENOSYS on a known architecture; EPERM, EACCES and unknown architectures are
+   errors), sets `umask 077`, changes to `SERVICE_HOME/app` and `execve`s the component. The recorded pid is
    therefore the component itself.
 
 ### Scripts
@@ -159,14 +167,23 @@ With isolation off, nothing changes. With it on, the launcher, running as root:
 * With isolation on, "already running" means a live tracked pid whose four uids are all the component's user and
   whose command line no longer holds `-m agents.isolation`; for a target, its user must also own the listening socket
   (`/proc/net/tcp`). A component found running as another uid, or a healthy port with no tracked isolated process, is
-  an error naming the fix (`restart` or `stop`), never "already up". A launch that does not come up isolated is
-  killed, and `stop` also signals any stray process of the service users (`pkill -u`).
+  an error naming the fix (`restart` or `stop`), never "already up". `status` applies the same acceptance
+  ("running (isolated)" or "running, NOT isolated — run restart"). A launch that does not come up isolated is
+  killed with its children, and `stop` repeats `pkill -u` for the service users until none of their processes is
+  left. A sweep that ends with survivors fails: `stop` exits non-zero after trying every service, and `restart`,
+  `start --fresh` and `reset` do not proceed. If the mode cannot be determined (e.g. a broken interpreter), `stop`
+  and `status` still work, sweeping the fixed service accounts without reading pid files from the unvalidated run
+  directory, while `start` fails closed.
+* Paths (`STRANGLER_STATE_DIR`, `ROUTER_STATE_FILE`, `MODERN_LISTS_PATH`) resolve the same way in the scripts and in
+  Python: relative to the checkout, and `~` or `~/…` to root's home. Named-user forms (`~name/…`) are refused.
 * `targets.sh start --fresh` with isolation on also runs `python -m agents.isolation reset`. This unlinks
   `proxy/router.json`, `fuzzer/divergence_registry.json` (and `.staging`) and `module/lists.py` in the service area.
 * `make clean-state` also runs `python -m agents.isolation clean`, whatever the mode, whenever a service area exists (so
   no API-key copy outlives isolation). It empties `SERVICE_HOME/state`:
-  each entry is first renamed inside the root-only `state/`, then removed with the descriptor-based `shutil.rmtree`
-  (no path an owner can swap is ever followed). `clean-state` keeps `switch.env` and `connection.env`.
+  each entry is first renamed inside the root-only `state/`, then removed by an iterative, descriptor-based remover
+  (every directory opened `O_DIRECTORY|O_NOFOLLOW` relative to its parent and identity-checked; no recursion, so a
+  deep tree a service built cannot crash it; `agents/` first; errors are reported per entry). As non-root it leaves
+  the service area alone. `clean-state` keeps `switch.env` and `connection.env`.
 * The run directory must be root-owned and not group- or other-writable. The default `.state/run` under the 0700
   checkout is out of every service's reach.
 
@@ -203,18 +220,26 @@ Exit status 0 only if every check passes; prints one table.
 3. **Startup smoke:** as each user, the service interpreter imports the component's module. This proves the
    interpreter, standard library and dependencies are reachable. In LLM mode, the first word of
    `STRANGLER_LLM_CMD` must resolve for `sr-translator` to an executable whose whole path only root can modify.
-4. **Secret exposure scan:** as each service user (root only lists names; it never opens a candidate, and its walker
-   opens directories with `O_DIRECTORY|O_NOFOLLOW`), read every reachable regular file, symlinks followed in the
-   dropped child with a visited set and caps, under `SERVICE_HOME`, `/tmp`,
-   `/var/tmp`, `/dev/shm`, `/etc`, `/home`, `/opt`, `/srv`, `/var/log`, `/var/lib/stranglerroom` and `/root`
-   (files over 8 MB are skipped). Search for every secret value: `switch.env` and Switch `.env` passwords, tokens and
-   keys, the router token, the three API keys, and the Mattermost database password. Any hit fails, except a user's
-   own API key in its own key copy.
+4. **Secret exposure scan.** It searches for every secret value: `switch.env` and Switch `.env` passwords, tokens and
+   keys, the router token, the three API keys, and every Mattermost database password. The search covers every
+   reachable regular file under `SERVICE_HOME`, `/tmp`, `/var/tmp`, `/dev/shm`, `/etc`, `/home`, `/opt`, `/srv`,
+   `/var/log`, `/var/lib/stranglerroom` and `/root`. Any hit fails, except a user's own API key in its own key copy
+   (matched by inode).
+   * Root only lists names, with an iterative descriptor walker (`O_DIRECTORY|O_NOFOLLOW`, depth at most
+     min(256, RLIMIT_NOFILE/4), entry, directory and time budgets). It never opens a candidate.
+   * The search happens in children dropped to the service users. World-readable files (o+r, every ancestor o+x)
+     are searched once per run and count for every subject. Each subject then searches only what its own uid or
+     groups add, and follows symlinks itself (visited set, caps).
+   * Large files are streamed in overlapping chunks, not skipped.
+   * Exhausting the 32 GiB / 2M-file budget, hitting a depth limit, or an unexpected listing/open error (EMFILE
+     included) makes the scan incomplete, and an incomplete scan FAILs. It never reports PASS.
 5. **Live processes:** every process running a component module is found from `/proc`, pid file or not. A
    duplicate, an untracked instance, or one with the wrong uid fails; SKIP means no instance exists. Each
    component's uids and groups match its user, each has its own session, and signals across components are
-   refused. Every listener on the Switch port and on 9000–9002, in either address family and on any address
-   (`[::1]` and `[::]` included), belongs to the expected uid;
+   refused. Every listener on the ports of the effective endpoints (`SWITCH_URL`, `PROXY_URL`, `LEGACY_URL`,
+   `MODERN_URL` — local ones: loopback, or any address this host can bind) and on 9000–9002, in either address family
+   and on any address (`[::1]` and `[::]` included), belongs to the expected uid; two owners expected on one port is
+   a FAIL;
    `ROUTER_ADMIN_TOKEN` is in the environment of proxy and gate only (root lacks `CAP_SYS_PTRACE` here, so each
    process's `/proc/<pid>/environ` is read as that process's own user); no secret value appears in any process's
    command line. A secret shorter than 8 characters cannot be searched for reliably and is reported SKIP.
