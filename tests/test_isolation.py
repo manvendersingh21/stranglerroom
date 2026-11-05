@@ -1510,7 +1510,9 @@ def test_listener_checks_cover_both_families_and_every_owner():
         assert sorted(found) == sorted([("127.0.0.1", NOBODY), ("::1", NOBODY)])
         rows = iso.listener_checks({port: ("proxy", NOBODY)})
         assert [r.status for r in rows] == ["PASS", "PASS"]
-        assert [r.status for r in iso.listener_checks({port: ("proxy", 4242)})] == ["FAIL", "FAIL"]
+        failing = iso.listener_checks({port: ("proxy", 4242)})
+        assert [r.status for r in failing] == ["FAIL", "FAIL"]
+        assert all(f"(it belongs to uid {NOBODY})" in r.check for r in failing)  # the squatter's owner is named
         squatter = _listen_as(0, "::1", free_port())  # nothing on a port at all: SKIP; a root squatter: FAIL
         try:
             other = squatter_port = iso.tcp_listeners()
