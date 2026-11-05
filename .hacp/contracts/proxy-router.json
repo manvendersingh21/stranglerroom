@@ -1,0 +1,16 @@
+{
+ "task_id": "proxy-router",
+ "peer": "opencode",
+ "model": "opencode/big-pickle",
+ "effort": "high",
+ "summary": "Strangler reverse proxy :9000 with token-gated flip",
+ "prompt": "Read docs/SPEC.md first; it is the binding contract. Use only the project venv (.venv/bin/python, .venv/bin/pytest); do not install new packages and do not modify files under tests/ or docs/. Keep code clean, typed, documented, and production quality. Do not touch .switch-infra/ or .native/. Implement SPEC \u00a76: targets/proxy/router.py \u2014 an ASGI app (Starlette is available via fastapi; or plain ASGI) served by uvicorn when run as `python -m targets.proxy.router --port N` (argparse --port default 9000, --host default 127.0.0.1). Read env LEGACY_URL (default http://127.0.0.1:9001), MODERN_URL (default http://127.0.0.1:9002), ROUTER_STATE_FILE (default <repo>/.state/router.json; create parent dirs), ROUTER_ADMIN_TOKEN (default strangler-local-token). Re-read the state file on each request is NOT required; keep state in memory and write it atomically on flip; load it at startup. Use one shared httpx.AsyncClient (timeout 30s, no redirects followed) created in lifespan. Forward method, path, raw query string, body, headers minus hop-by-hop and host; return upstream status, body and headers minus hop-by-hop/content-length/content-encoding, plus X-Strangler-Upstream. tests/fake_upstream.py is the test upstream.",
+ "outputs": [
+  "targets/proxy/router.py"
+ ],
+ "acceptance": [
+  ".venv/bin/pytest -q tests/test_proxy.py"
+ ],
+ "max_rework": 2,
+ "timeout_s": 1800
+}

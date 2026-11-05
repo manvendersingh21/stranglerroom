@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "switch-docs": {
+      "serverUrl": "https://docs.switchagents.ai/mcp"
+    }
+  }
+}

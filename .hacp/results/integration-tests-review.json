@@ -1,0 +1,24 @@
+{
+  "task_id": "integration-tests-review",
+  "session": "s-integration-tests-review-2a6df7",
+  "ledger": ".hacp/sessions/s-integration-tests-review-2a6df7.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-integration-tests-review-2a6df7",
+  "revision": "ac069225a3702a4b7c1d2d5efa9e47d636c3dfc4fe73b7f97ca81b7a13f5d1ce",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/integration_tests.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/integration_tests.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/integration_tests.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

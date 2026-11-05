@@ -1,0 +1,19 @@
+{
+ "task_id": "legacy-target",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "Shared dataset + faithful web.py legacy Open Library target with quirks D-1..D-5",
+ "prompt": "Read docs/SPEC.md first; it is the binding contract. Use only the project venv (.venv/bin/python, .venv/bin/pytest); do not install new packages and do not modify files under tests/ or docs/. Keep code clean, typed, documented, and production quality. Do not touch .switch-infra/ or .native/. Implement SPEC \u00a71 (targets/common/dataset.py) and SPEC \u00a72+\u00a73(legacy column)+\u00a75: targets/legacy_openlibrary/infogami_shim.py, targets/legacy_openlibrary/openlibrary/__init__.py, targets/legacy_openlibrary/openlibrary/plugins/__init__.py, targets/legacy_openlibrary/openlibrary/plugins/openlibrary/__init__.py, targets/legacy_openlibrary/openlibrary/plugins/openlibrary/lists.py, targets/legacy_openlibrary/server.py (argparse --port default 9001, --host default 127.0.0.1; cheroot via web.py, numthreads=30). The lists.py must look like real Open Library plugin code (delegate.page subclasses with path/encoding attributes, web.input, web.data, web.header) because another agent AST-parses it to extract routes. Legacy D-5 must be a genuine unhandled ZeroDivisionError reaching web.py's default internalerror handler (web.config.debug=False) \u2014 do not fake the 500. Make sure the server process exits cleanly on SIGTERM.",
+ "outputs": [
+  "targets/common/dataset.py",
+  "targets/legacy_openlibrary/infogami_shim.py",
+  "targets/legacy_openlibrary/openlibrary/plugins/openlibrary/lists.py",
+  "targets/legacy_openlibrary/server.py"
+ ],
+ "acceptance": [
+  ".venv/bin/pytest -q tests/test_legacy_contract.py"
+ ],
+ "max_rework": 2,
+ "timeout_s": 2400
+}

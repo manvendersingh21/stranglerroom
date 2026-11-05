@@ -1,0 +1,36 @@
+{
+ "task_id": "docs-readme-accuracy-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "Accuracy review of README.md against the repo files and live facts",
+ "prompt": "You are a strict fact-checker for README.md of the StranglerRoom hackathon project. The README must be ACCURATE: every command, path, port, flag, env var, number and claim must match the inlined source files or the inlined live facts (readme_facts.txt: real command outputs gathered on the dev box; channel_transcript.txt: the real Mattermost channel of the live run). Go through README.md section by section and line by line. For each inaccuracy report: the README line/quote, why it is wrong, the evidence (file + quote), and the exact replacement text. Also flag (a) claims that cannot be verified from the inlined material (say what evidence would be needed), (b) commands that would not work as written (wrong flag, wrong make target, wrong path, missing prerequisite), (c) numbers that do not add up (test counts per category vs the per-file collection, request counts, timings, HACP tallies: count settled/escalated task_ids yourself from the results and session tables), (d) misleading wording (overclaims about Switch features, security, or performance), (e) important omissions for a judge trying to run it. Do NOT rewrite the README; do not suggest stylistic changes unless they fix clarity of a fact. Write the review to .hacp/reviews/docs-readme.md with sections '## Findings' (numbered, most severe first, each tagged [wrong]/[unverifiable]/[broken-command]/[misleading]/[omission]) and '## Checked and fine' (a list of the README claims you verified, with the evidence).",
+ "outputs": [
+  ".hacp/reviews/docs-readme.md"
+ ],
+ "context": [
+  "README.md",
+  "Makefile",
+  "docs/AGENTS_SPEC.md",
+  "docs/SPEC.md",
+  "scripts/targets.sh",
+  "scripts/agents.sh",
+  "scripts/bootstrap_switch.sh",
+  ".github/workflows/e2e.yml",
+  "agents/provision.py",
+  "agents/ledger.py",
+  "agents/commands.py",
+  "strangler-room.template.yaml",
+  "requirements.txt",
+  "pytest.ini",
+  ".gitignore",
+  "/tmp/claude-0/-root-another-hackathon/41671522-265f-4090-a55b-52ffb2ec73d0/scratchpad/readme_facts.txt",
+  "/tmp/claude-0/-root-another-hackathon/41671522-265f-4090-a55b-52ffb2ec73d0/scratchpad/channel_transcript.txt"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/docs-readme.md",
+  "grep -q '## Checked and fine' .hacp/reviews/docs-readme.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

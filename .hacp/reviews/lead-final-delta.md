@@ -1,0 +1,11 @@
+## Findings
+
+1. **P1 — Proxy and gate can resolve different admin tokens.** `agents/cutover_agent.py:106`; `targets/proxy/router.py:148`. Without an explicit token, the gate uses `STATE_DIR`, while the proxy uses `ROUTER_STATE_FILE`’s parent. Setting only `ROUTER_STATE_FILE=/srv/router/router.json`, or only `STRANGLER_STATE_DIR`, makes the processes generate different secrets. Every gate flip, including rollback, then receives HTTP 403. **Minimal fix:** use one shared token-directory resolution rule in both processes, honoring the same configuration. Verify authentication through an actual gate instance with each state-path override.
+
+2. **P2 — History pagination stalls on a full page sharing one timestamp.** `agents/translator_agent.py:888`; `agents/translator_agent.py:895`. Suppose a valid approval is followed by 200 messages sharing millisecond T. The first page contains those 200 messages. Paging with `before=T+1 ms` returns exactly the same page; the repeated-oldest guard stops the scan, so the approval is never found even though it is within the history limit. Every retry repeats this failure. The supplied tests use increasing timestamps and miss it. **Minimal fix:** when the inclusive boundary produces no progress, advance to exclusive `before=T` so older timestamps remain reachable. Exhaustively traversing more than one page within T requires a stable secondary cursor, such as message ID.
+
+3. **P2 — Whitespace normalization differs between token consumers.** `targets/common/router_token.py:21`; `agents/cutover_agent.py:106`. With `ROUTER_ADMIN_TOKEN=" explicit "`, the proxy resolves `explicit`, while the gate takes the untrimmed `ROUTER_ADMIN_TOKEN` constant directly. Its authenticated requests consequently receive HTTP 403. Previously both consumers used the same raw environment value. The new resolver test checks trimming without exercising the gate. **Minimal fix:** normalize the environment token consistently before the gate selects it, preferably through the shared resolver. Add a gate-to-proxy authentication check using a padded environment value.
+
+## Verdict
+
+Request changes. Token resolution can disable cutover and rollback, and timestamp ties can prevent verification of a valid approval. Review based solely on the supplied code; no commands or tests were run.

@@ -1,0 +1,19 @@
+{
+  "task_id": "smoke-codex",
+  "session": "s-smoke-codex-f30617",
+  "ledger": ".hacp/sessions/s-smoke-codex-f30617.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-smoke-codex-f30617",
+  "revision": "c7365bcd5b02cb1dd39a0f7a9be5ec21ae4b5da2bbc2dd55459f02123cbcc8f8",
+  "verdict": "settled",
+  "merged": [
+    ".state/smoke/smoke_add.py"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": ".venv/bin/python -c \"import importlib.util as u; s=u.spec_from_file_location('m','.state/smoke/smoke_add.py'); m=u.module_from_spec(s); s.loader.exec_module(m); assert m.add(2,3)==5\"",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

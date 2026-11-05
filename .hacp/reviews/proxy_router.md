@@ -1,0 +1,15 @@
+## Findings
+
+1. **High — `targets/proxy/router.py:477`: Shared cookies leak between callers and upstreams.** The shared `httpx.AsyncClient` stores upstream `Set-Cookie` values and automatically attaches matching cookies to subsequent requests. After one caller receives a session cookie, another caller without a `Cookie` header can inherit that session. Cookies can also cross the legacy/modern ports because cookie matching ignores ports. **Minimal fix:** build each outgoing request with exactly the incoming cookies, removing any cookies supplied by the client's cookie jar before sending. Add tests with independent callers and a flip between upstreams.
+
+2. **Medium — `targets/proxy/router.py:423`: Non-string targets can raise an unhandled exception.** An authenticated flip containing `{"target":[]}` or `{"target":{}}` raises `TypeError` during frozenset membership testing, returning 500 instead of the required 400. The same check at line 112 makes an equivalent persisted value prevent startup. **Minimal fix:** verify `isinstance(target, str)` before checking membership in both locations. Add tests for array and object targets in requests and persisted state.
+
+3. **Medium — `targets/proxy/router.py:433`: Flip requests can omit required audit fields.** A valid token and `{"target":"modern"}` succeed, as do explicit null values for `approved_by` and `evidence`. SPEC §6 requires both request fields to be strings, so cutover can currently succeed without the required approval attribution and evidence. **Minimal fix:** reject either field unless it is a string. Add missing-field and null-field tests.
+
+4. **Medium — `targets/proxy/router.py:231`: Valid non-ASCII header bytes cause forwarding failures.** Incoming header values are decoded with Latin-1 and passed to HTTPX as strings at line 480. HTTPX encodes string headers as ASCII, so a header containing an allowed byte such as `0xe9` raises `UnicodeEncodeError`. The `httpx.HTTPError` handler does not catch it, and the request fails with 500. **Minimal fix:** preserve request headers as byte pairs while filtering names and connection tokens. Add a forwarding test containing a non-ASCII header value.
+
+5. **Medium — `targets/proxy/router.py:74`: Content encoding is removed even when HTTPX cannot decode it.** A browser can advertise `br` or `zstd`, which the proxy forwards. If the upstream returns that encoding and HTTPX's optional decoder is unavailable, `response.content` remains compressed, but the proxy removes `Content-Encoding`. The caller receives compressed bytes presented as an unencoded response. **Minimal fix:** forward raw response bytes with their original content encoding, closing the streamed upstream response reliably. Add a compressed-response test that does not depend on an optional decoder being installed.
+
+## Verdict
+
+Request changes. The proxy has a cross-request cookie leak, invalid-input failures, and forwarding and audit-contract violations. The supplied tests do not exercise these scenarios.

@@ -1,0 +1,19 @@
+{
+  "task_id": "fuzzer-review",
+  "session": "s-fuzzer-review-38acc1",
+  "ledger": ".hacp/sessions/s-fuzzer-review-38acc1.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-fuzzer-review-38acc1",
+  "revision": "9dfc1ed92e05c8d56a2f9e599e14a7bdd4e354ffa043ec60ecd67d1e12ccba3e",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/fuzzer_agent.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/fuzzer_agent.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "task_id": "review-bench",
+  "session": "s-review-bench-98dfa0",
+  "ledger": ".hacp/sessions/s-review-bench-98dfa0.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-review-bench-98dfa0",
+  "revision": "a2cb28bc444ab7a6fd3b4d5324928335c71edef21d27c665bc625f64bcaf9462",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/bench.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/bench.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/bench.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

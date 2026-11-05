@@ -1,0 +1,19 @@
+{
+  "task_id": "template-room-yaml",
+  "session": "s-template-room-yaml-95d06a",
+  "ledger": ".hacp/sessions/s-template-room-yaml-95d06a.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-template-room-yaml-95d06a",
+  "revision": "b60881bc5a974ca0b6e8a2898b05e0e3b029573bef2c319665aeec30fe495ab2",
+  "verdict": "settled",
+  "merged": [
+    "strangler-room.template.yaml"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": ".venv/bin/python scripts/validate_template.py --offline-only strangler-room.template.yaml",
+      "passed": true,
+      "tail": "[offline] Switch engine: /root/another_hackathon/.switch-infra/core/.venv/bin/python -I -B (core /root/another_hackathon/.switch-infra/core)\n[offline] lint: 0 error(s), 0 warning(s)\n[offline] scenario bridged-default  ok  (strangler-migration)\n[offline] scenario no-bridge        ok  (strangler-migration)\n[offline] scenario check-room       ok  (strangler-migration-template-check)\n[offline] scenario bad-room-name    ok  (ValueError: param 'room_name': 'Not A Channel!' does not match the pattern '[a-z0-9][a-z0-9-]{1,62}')\n[offline] PASS\nstrangler-room.template.yaml: PASS (offline)\n"
+    }
+  ]
+}

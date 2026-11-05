@@ -1,0 +1,13 @@
+*.pyc
+.hacp/*.log
+.hacp/sessions/*.answer.md
+.hacp/sessions/*.log
+.hacp/work/
+.hypothesis/
+.native/
+.pytest_cache/
+.state/
+.switch-infra/
+.venv/
+__pycache__/
+targets/modern_fastapi/app/lists.py

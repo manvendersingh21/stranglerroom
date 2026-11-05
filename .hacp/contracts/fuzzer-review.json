@@ -1,0 +1,13 @@
+{
+ "task_id": "fuzzer-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "Adversarial code review of the @fuzzer room agent",
+ "prompt": "You are reviewing agents/fuzzer_agent.py (the @fuzzer Switch room agent) and its tests tests/test_fuzzer_agent.py against the binding contract docs/AGENTS_SPEC.md section 2 ('@fuzzer') plus the framework it builds on (agents/runtime.py RoomAgent, agents/commands.py grammar + MARK prefixes, agents/ledger.py documents, agents/divergence.py run_campaign/Registry). Produce ONE file, .hacp/reviews/fuzzer_agent.md, containing a section headed exactly '## Findings' with a numbered list of CONCRETE defects only, each with: file:line reference, severity (high/medium/low), a concrete failing scenario (input message / room state -> wrong behaviour), and the fix. Look especially for: spec deviations (rev wait <=30s, new migration -> fresh matrix + Registry().reset(), decisions read from the translator's ledger and cross-checked with handoff decisions, run_campaign arguments, add_run + upsert MATRIX_DOC with DOC_META, MARK prefixes the e2e driver matches, ask_human text must not contain '@translator', approved -> MARK approved_parity then handoff('cutover-gate', benchmark(rev, mig))); mention hygiene (any '@' in posted text that would address a participant); governance (who may trigger a campaign; impersonation via sender_name or a same-named document created by another agent); malformed input; state consistency on failure paths (registry reset but campaign failed, upsert failed); rehydration from the matrix document after restart; silent fallbacks (the project rule is fail loud: every fallback announced); test weaknesses (flaky timing, fixed ports, touching the real targets/modern_fastapi/app/lists.py, assertions that do not test what they claim). Do not report style nits. If something is fine, do not list it. After '## Findings' you may add '## Notes' for non-defect observations.",
+ "outputs": [".hacp/reviews/fuzzer_agent.md"],
+ "context": ["agents/fuzzer_agent.py", "tests/test_fuzzer_agent.py", "docs/AGENTS_SPEC.md", "agents/divergence.py", "agents/ledger.py", "agents/runtime.py", "agents/commands.py", "tests/fakes.py"],
+ "acceptance": ["grep -q '## Findings' .hacp/reviews/fuzzer_agent.md"],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

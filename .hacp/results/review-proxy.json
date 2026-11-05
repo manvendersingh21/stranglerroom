@@ -1,0 +1,24 @@
+{
+  "task_id": "review-proxy",
+  "session": "s-review-proxy-f0400d",
+  "ledger": ".hacp/sessions/s-review-proxy-f0400d.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-review-proxy-f0400d",
+  "revision": "1eab5c5123886fb6f5d8fcdb07e00889a019d7005abd2f82e14d4f14ab33a159",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/proxy_router.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/proxy_router.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/proxy_router.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

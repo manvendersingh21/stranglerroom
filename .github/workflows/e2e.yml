@@ -1,0 +1,78 @@
+name: e2e
+
+on:
+  push:
+    branches: [main, master]  # PRs are covered by pull_request; avoids a duplicate run per PR push
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: make install
+      - run: make test
+
+  e2e:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Bootstrap Switch 0.31.0 (docker)
+        env:
+          SWITCH_MODE: docker
+        run: bash scripts/bootstrap_switch.sh
+        timeout-minutes: 14
+      - name: Install dependencies
+        run: make install
+        timeout-minutes: 5
+      # `make e2e` runs the driver with --fresh, which provisions the agents and a fresh room itself.
+      - name: Run end-to-end demo
+        run: make e2e
+        timeout-minutes: 16
+      # The template check runs Switch's own template engine offline, so it needs switch-core's venv
+      # (docker mode does not build one), then validates through the live Gateway and does a live run.
+      - name: Prepare switch-core venv for the template engine
+        run: uv sync --frozen --no-dev --project .switch-infra/core
+        timeout-minutes: 4
+      - name: Validate the Switch room template (engine + live Gateway + live run)
+        run: .venv/bin/python scripts/validate_template.py --run
+        timeout-minutes: 3
+      - name: Collect compose logs
+        if: failure() || cancelled()  # cancelled: the 45 min job timeout reports as cancelled
+        run: |
+          mkdir -p .state/ci
+          docker compose -f .switch-infra/deploy/local/standalone-docker-compose.yml --project-directory .switch-infra --profile collab --profile gateway ps -a > .state/ci/compose.log 2>&1 || true
+          docker compose -f .switch-infra/deploy/local/standalone-docker-compose.yml --project-directory .switch-infra --profile collab --profile gateway logs --no-color --timestamps >> .state/ci/compose.log 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: failure() || cancelled()  # cancelled: the 45 min job timeout reports as cancelled
+        with:
+          name: e2e-logs
+          path: |
+            .state/run/*.log
+            .state/ci/compose.log
+          if-no-files-found: warn
+          include-hidden-files: true  # .state/ is a dot-directory; upload-artifact@v4 skips those by default
+          retention-days: 7

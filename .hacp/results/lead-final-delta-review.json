@@ -1,0 +1,24 @@
+{
+  "task_id": "lead-final-delta-review",
+  "session": "s-lead-final-delta-review-4cac1f",
+  "ledger": ".hacp/sessions/s-lead-final-delta-review-4cac1f.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-lead-final-delta-review-4cac1f",
+  "revision": "3f81553a1634ceba56fbbcd270ddef6a72a43511f5070168c1076e3d5854eb9a",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/lead-final-delta.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/lead-final-delta.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/lead-final-delta.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

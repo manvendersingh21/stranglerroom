@@ -1,0 +1,26 @@
+{
+ "task_id": "critic-hardening-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "Adversarial review of the critic's governance/replay hardening in the three agents and the native bootstrap",
+ "prompt": "You are an adversarial reviewer. critic-hardening-changes.txt lists the changes a critic just made to harden StranglerRoom's governance (human-only commands, replay protection, seal verification) and the native bootstrap stop path. The changed files are inlined in full, together with tests/fakes.py (FakeRoom: faithful Switch semantics) and docs/AGENTS_SPEC.md (the contract). Find REAL defects introduced or left by these changes: (a) any way the legitimate demo flow (docs/AGENTS_SPEC.md \u00a73: migrate -> v1 -> campaign -> decisions -> v2 -> 5/5 -> benchmark -> probe refusal -> human approve-cutover -> flip -> record-cutover -> seal) could now be wrongly refused or become flaky (timestamp units, truncation, clock sources, None handling, ordering of checks, exceptions that escape handlers); (b) remaining governance bypasses by an agent or a non-lead human; (c) replay paths still open; (d) shell bugs in the bootstrap start/stop changes (set -euo pipefail interactions, quoting, subshell exec, pgrep). Ground every finding in the inlined code with file:line and a concrete scenario; do not report style. Write .hacp/reviews/critic-hardening.md with '## Findings' (numbered, severity, evidence, exact fix) and '## Verified OK'.",
+ "outputs": [
+  ".hacp/reviews/critic-hardening.md"
+ ],
+ "context": [
+  "critic-hardening-changes.txt",
+  "agents/runtime.py",
+  "agents/cutover_agent.py",
+  "agents/translator_agent.py",
+  "scripts/bootstrap_switch.sh",
+  "tests/fakes.py",
+  "docs/AGENTS_SPEC.md",
+  "targets/proxy/router.py"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/critic-hardening.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

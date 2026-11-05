@@ -1,0 +1,24 @@
+{
+  "task_id": "integrate-loop-adversarial-review-opencode",
+  "session": "s-integrate-loop-adversarial-review-opencode-a48f2f",
+  "ledger": ".hacp/sessions/s-integrate-loop-adversarial-review-opencode-a48f2f.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-integrate-loop-adversarial-review-opencode-a48f2f",
+  "revision": "fd4ed78d7d6df7ecf0617213b1feaaa231fff63c24b77354fff8c2988bf0899b",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/agents_loop.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/agents_loop.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/agents_loop.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "task_id": "lead-final-round-rereview",
+  "session": "s-lead-final-round-rereview-ce984f",
+  "ledger": ".hacp/sessions/s-lead-final-round-rereview-ce984f.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-lead-final-round-rereview-ce984f",
+  "revision": "3558c0e3c76907429f2d487816ece848871db4fcf5d47e4c2ab0ad9a8a0a3a2b",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/lead-final-round-rereview.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/lead-final-round-rereview.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/lead-final-round-rereview.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+ "task_id": "legacy-introspect",
+ "peer": "agy",
+ "model": "claude-opus-4-6-thinking",
+ "summary": "AST route extractor for legacy web.py plugins",
+ "prompt": "Read docs/SPEC.md and docs/AGENTS_SPEC.md first; they are the binding contract. Use only the project venv (.venv/bin/python, .venv/bin/pytest); do not install packages; do not modify anything under tests/ or docs/; do not touch .switch-infra/ or .native/ or any file not listed as your deliverable. Production quality, documented code. Implement agents/legacy_introspect.py exactly per the API in the docstring of tests/test_legacy_introspect.py (pure `ast`, never import/exec the target). Template param names come from the handler method's positional parameters after self, substituted for the regex capture groups in order; strip a trailing `(?:\\.json)?` if present. Add a CLI: `python -m agents.legacy_introspect <file>` prints render_route_table.",
+ "outputs": [
+  "agents/legacy_introspect.py"
+ ],
+ "acceptance": [
+  ".venv/bin/pytest -q tests/test_legacy_introspect.py"
+ ],
+ "max_rework": 2,
+ "timeout_s": 1800
+}

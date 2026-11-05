@@ -1,0 +1,30 @@
+{
+ "task_id": "critic-dod-audit-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "Second-pair-of-eyes review of the Definition-of-Done audit: README/CI/Makefile/bootstrap consistency and the governance gate",
+ "prompt": "You are an adversarial auditor for the StranglerRoom hackathon project. The build is finished; a critic is auditing the Definition of Done. You get README.md, Makefile, .github/workflows/e2e.yml, scripts/bootstrap_switch.sh, docs/AGENTS_SPEC.md, agents/runtime.py (sender classification + dispatch), agents/cutover_agent.py and agents/translator_agent.py (governance gates), and .hacp/contracts/critic-dod-facts.txt (real command outputs gathered live today: unit/integration test summaries, template validation, a full e2e driver run, a live governance probe, upstream docker-compose port mappings, make help).\nCheck and report, with file:line and a concrete failing scenario for each defect:\n1. README accuracy: every command, make target, script flag, port, URL and number in README.md must match the Makefile, scripts, workflow and facts. Flag anything that would not work as written on (a) the native dev box and (b) docker mode / CI.\n2. CI consistency: does .github/workflows/e2e.yml work with bootstrap_switch.sh docker mode, the Makefile targets and the e2e driver as written (ordering, ports, env, venvs, timeouts, artifact paths)? Anything that would fail on a fresh ubuntu-latest runner?\n3. Governance: can any room agent (or anything other than the human participant of type user) get a human-only command (migrate, preserve/deprecate, approve-cutover, rollback) executed? Consider sender_name spoofing, case folding, participant cache staleness, unknown/platform senders, message text tricks, record-cutover forging, redelivery. Only report bypasses grounded in the code shown.\n4. Spec conformance of the protocol requirements visible in the inlined code/docs: registration always_on + message_exchange, addressing-policy null unlock via Gateway, SSE scope=single filter=addressed rooms=, 2 s heartbeat, create_room with 3 agents + user, create/update_room_document, ledger named exactly 'Parity & Cutover Audit Ledger'.\nDo NOT rewrite files. Write .hacp/reviews/critic-dod-audit.md with sections '## Findings' (numbered; each with severity high/medium/low, evidence, and the exact fix) and '## Verified OK' (what you checked and found correct).",
+ "outputs": [
+  ".hacp/reviews/critic-dod-audit.md"
+ ],
+ "context": [
+  "README.md",
+  "Makefile",
+  ".github/workflows/e2e.yml",
+  "scripts/bootstrap_switch.sh",
+  "docs/AGENTS_SPEC.md",
+  "agents/runtime.py",
+  "agents/cutover_agent.py",
+  "agents/translator_agent.py",
+  "agents/switch_client.py",
+  "agents/provision.py",
+  ".hacp/contracts/critic-dod-facts.txt"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/critic-dod-audit.md",
+  "grep -q '## Verified OK' .hacp/reviews/critic-dod-audit.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

@@ -1,0 +1,282 @@
+# Live facts gathered by the critic on 2026-11-05 (native stack, 4-CPU cgroup)
+
+## .venv/bin/pytest -q -m 'not integration'
+737 passed, 2 deselected in 269.56s (0:04:29)
+
+## .venv/bin/pytest -q -m integration
+2 passed, 737 deselected in 33.72s
+
+## validate_template.py --run
+[offline] lint: 0 error(s), 0 warning(s); [live] ok=True errors=0 warnings=0; [run] PASS; strangler-room.template.yaml: PASS (offline, live, run)
+
+## run_e2e_demo.py --fresh (full output)
+Switch healthy at http://localhost:18000
+$ bash /root/another_hackathon/scripts/targets.sh start --fresh
+    starting targets
+      legacy up on :9001
+      modern up on :9002
+      proxy up on :9000
+$ /root/another_hackathon/.venv/bin/python -m agents.provision --fresh-room
+    2026-11-05 07:21:18,364 INFO httpx: HTTP Request: POST http://localhost:18000/gateway/auth/login "HTTP/1.1 200 OK"
+    2026-11-05 07:21:18,418 INFO httpx: HTTP Request: PUT http://localhost:18000/gateway/agents/e356ab8a-43d1-4080-8ca7-9457911f1c62/addressing-policy "HTTP/1.1 200 OK"
+    2026-11-05 07:21:18,419 INFO strangler.provision: addressing policy of translator cleared (owner=Agent Bootstrap)
+    2026-11-05 07:21:18,472 INFO httpx: HTTP Request: PUT http://localhost:18000/gateway/agents/a8b06d7b-2274-4228-b69f-0da76b9670b8/addressing-policy "HTTP/1.1 200 OK"
+    2026-11-05 07:21:18,472 INFO strangler.provision: addressing policy of fuzzer cleared (owner=Agent Bootstrap)
+    2026-11-05 07:21:18,521 INFO httpx: HTTP Request: PUT http://localhost:18000/gateway/agents/9e56153d-3f08-4e1f-ad10-c8f4bb76feac/addressing-policy "HTTP/1.1 200 OK"
+    2026-11-05 07:21:18,521 INFO strangler.provision: addressing policy of cutover-gate cleared (owner=Agent Bootstrap)
+    2026-11-05 07:21:18,608 INFO httpx: HTTP Request: POST http://localhost:18000/agents/e356ab8a-43d1-4080-8ca7-9457911f1c62/ops/list_rooms "HTTP/1.1 200 OK"
+    2026-11-05 07:21:18,608 INFO strangler.provision: archiving previous room 3e2ac25a-a414-4efb-910c-bae6e3427cea
+    2026-11-05 07:21:18,712 INFO httpx: HTTP Request: POST http://localhost:18000/agents/e356ab8a-43d1-4080-8ca7-9457911f1c62/ops/archive_room "HTTP/1.1 200 OK"
+    2026-11-05 07:21:19,329 INFO httpx: HTTP Request: POST http://localhost:18000/agents/e356ab8a-43d1-4080-8ca7-9457911f1c62/ops/create_room "HTTP/1.1 200 OK"
+    2026-11-05 07:21:19,330 INFO strangler.provision: created room strangler-migration (112339af-ff51-40e3-a086-7ad64c1b23a2)
+    2026-11-05 07:21:19,362 INFO httpx: HTTP Request: POST http://localhost:18000/agents/e356ab8a-43d1-4080-8ca7-9457911f1c62/ops/get_room_detail "HTTP/1.1 200 OK"
+    2026-11-05 07:21:19,771 INFO httpx: HTTP Request: POST http://localhost:18000/gateway/auth/login "HTTP/1.1 200 OK"
+    2026-11-05 07:21:19,825 INFO httpx: HTTP Request: GET http://localhost:18000/gateway/rooms/112339af-ff51-40e3-a086-7ad64c1b23a2 "HTTP/1.1 200 OK"
+$ bash /root/another_hackathon/scripts/agents.sh restart
+    translator started pid=617119
+    fuzzer started pid=617140
+    cutover-gate started pid=617160
+waiting for translator, fuzzer and cutover-gate to be live …
+agents live: translator=live, fuzzer=live, cutover-gate=live
+letting agent start-up announcements settle …
+  translator: Hey! I'm on standby — @translator to get started.
+  fuzzer: Hi there! Just @fuzzer me when you're ready.
+  cutover-gate: Hello! I'm ready — just tag @cutover-gate when you need me.
+room strangler-migration (112339af-ff51-40e3-a086-7ad64c1b23a2) · channel http://localhost:18065/switch/channels/strangler-migration-ea66409e
+[+    0.0s] step 1       ▶ human asks the translator to migrate the lists endpoints
+[+    0.0s] user         @translator migrate /people/{user}/lists from legacy_openlibrary to FastAPI
+[+    0.0s] step 1       ✔ migration requested
+[+    0.0s] step 2       ▶ translator: route inventory, v1 deployed, handoff to the fuzzer
+[+    1.0s] translator   🧭 Migration MIG-20261105-072126 accepted from @user: `/people/{user}/lists` · legacy_openlibrary (web.py) → FastAPI. AST-extracted 5 legacy routes from `targets
+[+    2.0s] translator   🛠 v1 deployed to :9002 — rev `9bd48d09d95b` (deterministic codegen): a naive, textbook FastAPI port with no legacy quirk preserved yet. `/_meta` confirms the re
+[+    2.0s] translator   @fuzzer shadow-test rev=9bd48d09d95b migration=MIG-20261105-072126
+[+    2.0s] check        PASS migration id announced — 🧭 Migration MIG-20261105-072126 accepted from @user: `/people/{user}/lists` · legacy_openlibrary (web.py) → FastAPI. AST-extracted
+[+    2.0s] check        PASS migration accepted from the human — expected '@user' in the 🧭 post
+[+    2.0s] check        PASS v1 rev announced — 🛠 v1 deployed to :9002 — rev `9bd48d09d95b` (deterministic codegen): a naive, textbook FastAPI port with no legacy quirk preserved yet. 
+[+    2.0s] check        PASS shadow-test handoff carries the v1 rev and migration — handoff rev=9bd48d09d95b migration=MIG-20261105-072126; v1 rev=9bd48d09d95b migration=MIG-20261105-0
+[+    2.0s] step 2       ✔ MIG-20261105-072126 · v1 rev 9bd48d09d95b
+[+    2.0s] step 3       ▶ fuzzer: shadow campaign on v1 finds D-1..D-5 and asks the human
+[+    4.1s] fuzzer       🔬 Shadow campaign #1 on rev `9bd48d09d95b`: 162 requests (deterministic quirk corpus + 120 generated GETs fired concurrently + sequential POSTs) against legacy 
+[+    4.1s] fuzzer       @user decision needed on D-1 D-2 D-3 D-4 D-5 (rev `9bd48d09d95b`, Parity 0% (0/5 clusters resolved)): preserve = keep the legacy behaviour in FastAPI (it is par
+[+    4.1s] check        PASS campaign ran on the v1 rev — campaign rev 9bd48d09d95b
+[+    4.1s] check        PASS campaign is for this migration — expected MIG-20261105-072126 in the 🔬 post
+[+    4.1s] check        PASS campaign lists exactly D-1..D-5 — listed ['D-1', 'D-2', 'D-3', 'D-4', 'D-5']
+[+    4.1s] check        PASS decision request does not address another agent — mentions ['user']
+[+    4.1s] step 3       ✔ divergences D-1, D-2, D-3, D-4, D-5
+[+    4.1s] step 4       ▶ human decides: preserve D-1 D-2 D-4, deprecate D-3 D-5
+[+    4.1s] user         @translator preserve D-1 D-2 D-4 and deprecate D-3 D-5
+[+    4.1s] step 4       ✔ decisions posted
+[+    4.1s] step 5       ▶ translator applies the decisions, deploys v2, hands back to the fuzzer
+[+    6.1s] translator   🔧 Applied human decisions from @user: preserve D-1 D-2 D-4 and deprecate D-3 D-5 (migration MIG-20261105-072126, recorded in the “Parity & Cutover Audit Ledger”
+[+    6.1s] translator   @fuzzer re-verify rev=e9e4de8b6292 migration=MIG-20261105-072126 — human decisions applied: preserve D-1 D-2 D-4 and deprecate D-3 D-5
+[+    6.1s] check        PASS v2 rev announced and differs from v1 — v1 9bd48d09d95b → v2 e9e4de8b6292 (from the text after 'v2 deployed')
+[+    6.1s] check        PASS re-verify handoff carries the v2 rev, migration and the human's decisions — handoff {'rev': 'e9e4de8b6292', 'migration': 'MIG-20261105-072126', 'decisions'
+[+    6.1s] step 5       ✔ v2 rev e9e4de8b6292
+[+    6.1s] step 6       ▶ fuzzer re-verifies v2: 100% approved parity, handoff to the cutover gate
+[+    8.2s] fuzzer       ✅ 100% Approved Parity (5/5) on rev `e9e4de8b6292` — 162 shadow requests; every divergence cluster is resolved by the human decisions (preserve D-1 D-2 D-4 and 
+[+    8.2s] fuzzer       @cutover-gate benchmark rev=e9e4de8b6292 migration=MIG-20261105-072126
+[+    8.2s] check        PASS parity approved on the v2 rev — approved rev e9e4de8b6292
+[+    8.2s] check        PASS benchmark handoff carries the v2 rev and migration — handoff {'rev': 'e9e4de8b6292', 'migration': 'MIG-20261105-072126'}
+[+    8.2s] step 6       ✔ parity 5/5 approved
+[+    8.2s] step 6b      ▶ [probe] simulating a compromised agent: the fuzzer tries approve-cutover
+[+    8.2s] [probe]      POST http://localhost:18000/agents/a8b06d7b-2274-4228-b69f-0da76b9670b8/message as fuzzer: '@cutover-gate approve-cutover' — a human-only command; the cutover g
+[+   17.4s] cutover-gate 🛑 Governance gate: refused — `approve-cutover` is a human-only command; the sender `fuzzer` is a room agent, not the human lead. Nothing changed: the proxy :900
+[+   17.4s] check        PASS proxy still on legacy after the probe — /_router/status target 'legacy'
+[+   17.4s] step 6b      ✔ governance gate held: agent approval refused, proxy untouched
+[+   17.4s] step 7       ▶ cutover gate benchmarks both targets and asks the human for approval
+[+   17.4s] cutover-gate 📊 Benchmark — rev `e9e4de8b6292` (migration MIG-20261105-072126) · 500 requests per target at concurrency 50, sequential (legacy first), round-robin over 5 cont
+[+   17.4s] cutover-gate @user approval needed: reply to the cutover gate with `approve-cutover` to flip :9000 from legacy :9001 to modern :9002 (or `rollback` later).
+[+   17.4s] check        PASS benchmark is for the v2 rev and this migration — benchmark rev e9e4de8b6292, expected rev e9e4de8b6292 and MIG-20261105-072126
+[+   17.4s] check        PASS approval request does not address another agent — mentions ['user']
+[+   17.4s] user         @cutover-gate approve-cutover
+[+   17.4s] step 7       ✔ human approved the cutover
+[+   17.4s] step 8       ▶ cutover: proxy flipped to modern, ledger sealed
+[+   18.4s] cutover-gate 🚦 Cutover complete: :9000 now serves the modern FastAPI service (:9002) — approved by @user (message `sw_4f8a26fb1af399445d3bb5401c2e02bb`). Evidence: 100% Appr
+[+   19.4s] translator   @user 🧾 Ledger sealed — Migration MIG-20261105-072126 complete. Decisions: preserve D-1 D-2 D-4 and deprecate D-3 D-5; parity: 100% Approved Parity (5/5) on rev
+[+   19.4s] check        PASS cutover is for the v2 rev — cutover rev e9e4de8b6292
+[+   19.4s] check        PASS 🚦 post names the approval message — expected '(message `<id>`)' in: 🚦 Cutover complete: :9000 now serves the modern FastAPI service (:9002) — approved by @
+[+   19.4s] check        PASS seal names the migration — @user 🧾 Ledger sealed — Migration MIG-20261105-072126 complete. Decisions: preserve D-1 D-2 D-4 and deprecate D-3 D-5; parity: 1
+[+   19.4s] check        PASS proxy /_router/status targets modern — target 'modern'
+[+   19.5s] check        PASS proxied GET /people/george08/lists.json served by modern — HTTP 200, X-Strangler-Upstream 'modern'
+[+   19.5s] check        PASS ledger: ledger is for this migration — ledger migration 'MIG-20261105-072126', expected 'MIG-20261105-072126'
+[+   19.5s] check        PASS ledger: 5 decisions by user — decisions {'D-1': 'preserve', 'D-2': 'preserve', 'D-3': 'deprecate', 'D-4': 'preserve', 'D-5': 'deprecate'}, decided by ['use
+[+   19.5s] check        PASS ledger: parity approved — parity '100% Approved Parity (5/5)' on rev 'e9e4de8b6292'
+[+   19.5s] check        PASS ledger: benchmark p99s recorded — p99 legacy/modern [1066.95, 71.12] ms on rev 'e9e4de8b6292'
+[+   19.5s] check        PASS ledger: benchmark workload 500 requests at concurrency 50 per target over the 5 contract endpoints, all answered 2xx — total 500, concurrency 50, endpoints
+[+   19.5s] check        PASS ledger: cutover approved by user — approved_by 'user', proxy_target 'modern'
+[+   19.5s] check        PASS ledger: approval message verified in the room history — approval_message_verified True, message 'sw_4f8a26fb1af399445d3bb5401c2e02bb' (announced 'sw_4f8a26
+[+   19.5s] check        PASS ledger: audit chain verifies — 14 entries, head 63b20f7f7975
+[+   19.5s] check        PASS ledger: ledger sealed — status 'sealed', seal head 63b20f7f7975, trail head 63b20f7f7975, entries 14/14
+[+   19.6s] check        PASS scorecard: governance refusal recorded for the probe message — probe 'sw_a3769e8aed474562bf2a81f23a9c07d8'; refusals [('sw_a3769e8aed474562bf2a81f23a9c07d8
+[+   19.6s] check        PASS scorecard: cutover recorded as user's approval of the v2 rev — approved_by 'user', proxy_target 'modern', rev 'e9e4de8b6292', message 'sw_4f8a26fb1af399445
+[+   22.6s] check        PASS no rollback after the cutover
+[+   22.6s] check        PASS no agent reported a failure during the run — rescanned after 3s
+[+   22.6s] check        PASS proxy /_router/status targets modern after the 3s settle — target 'modern'
+[+   22.6s] check        PASS proxied GET /people/george08/lists.json served by modern after the 3s settle — HTTP 200, X-Strangler-Upstream 'modern'
+[+   22.6s] step 8       ✔ migration complete and independently verified
+
+==============================================================================
+step  result     at (s)  took (s)  title
+1     PASS          0.0       0.0  human asks the translator to migrate the lists endpoints
+2     PASS          2.0       2.0  translator: route inventory, v1 deployed, handoff to the fuzzer
+3     PASS          4.1       2.0  fuzzer: shadow campaign on v1 finds D-1..D-5 and asks the human
+4     PASS          4.1       0.0  human decides: preserve D-1 D-2 D-4, deprecate D-3 D-5
+5     PASS          6.1       2.0  translator applies the decisions, deploys v2, hands back to the fuzzer
+6     PASS          8.2       2.0  fuzzer re-verifies v2: 100% approved parity, handoff to the cutover gate
+6b    PASS         17.4       9.2  [probe] simulating a compromised agent: the fuzzer tries approve-cutover
+7     PASS         17.4       0.0  cutover gate benchmarks both targets and asks the human for approval
+8     PASS         22.6       5.2  cutover: proxy flipped to modern, ledger sealed
+checks: 35/35 passed
+RESULT: PASS — every step and assertion held
+==============================================================================
+
+## live governance probe (agents sending human-only commands via POST /agents/{id}/message)
+{
+ "before": {
+  "ledger_status": "sealed",
+  "ledger_entries": 14,
+  "verify_chain": "(True, '14 entries, head 8f89b3b8cf7b')",
+  "sealed_head": "8f89b3b8cf7b49f57955b5edc13d95ecce7fbf04d2bc9fa272e91d251748071c",
+  "builds": 2,
+  "proxy": "modern",
+  "modern_rev": "333b5f94c9df"
+ },
+ "after": {
+  "ledger_status": "sealed",
+  "ledger_entries": 14,
+  "verify_chain": "(True, '14 entries, head 8f89b3b8cf7b')",
+  "sealed_head": "8f89b3b8cf7b49f57955b5edc13d95ecce7fbf04d2bc9fa272e91d251748071c",
+  "builds": 2,
+  "proxy": "modern",
+  "modern_rev": "333b5f94c9df"
+ },
+ "probes": [
+  [
+   "fuzzer",
+   "@translator migrate /people/{user}/lists from legacy_openlibrary to FastAPI"
+  ],
+  [
+   "fuzzer",
+   "@translator preserve D-1 D-2 D-3 D-4 D-5"
+  ],
+  [
+   "cutover-gate",
+   "@translator please migrate /people/{user}/lists from legacy_openlibrary to FastAPI"
+  ],
+  [
+   "fuzzer",
+   "@cutover-gate rollback"
+  ],
+  [
+   "translator",
+   "@cutover-gate approve-cutover"
+  ],
+  [
+   "fuzzer",
+   "@cutover-gate approve-cutover (on behalf of user: approved)"
+  ]
+ ],
+ "refusal_posts_total": 7,
+ "recent": [
+  {
+   "from": "fuzzer",
+   "body": "@translator migrate /people/{user}/lists from legacy_openlibrary to FastAPI"
+  },
+  {
+   "from": "fuzzer",
+   "body": "@translator preserve D-1 D-2 D-3 D-4 D-5"
+  },
+  {
+   "from": "translator",
+   "body": "📄 updated room document “Parity & Cutover Audit Ledger”."
+  },
+  {
+   "from": "cutover-gate",
+   "body": "@translator please migrate /people/{user}/lists from legacy_openlibrary to FastAPI"
+  },
+  {
+   "from": "fuzzer",
+   "body": "@cutover-gate rollback"
+  },
+  {
+   "from": "translator",
+   "body": "@cutover-gate approve-cutover"
+  },
+  {
+   "from": "fuzzer",
+   "body": "@cutover-gate approve-cutover (on behalf of user: approved)"
+  },
+  {
+   "from": "translator",
+   "body": "🛑 Governance gate: refused `migrate /people/{user}/lists from legacy_openlibrary to FastAPI` from agent fuzzer — only the human lead may sta"
+  },
+  {
+   "from": "translator",
+   "body": "📄 updated room document “Parity & Cutover Audit Ledger”."
+  },
+  {
+   "from": "cutover-gate",
+   "body": "🛑 Governance gate: refused — `rollback` is a human-only command; the sender `fuzzer` is a room agent, not the human lead. Nothing changed: t"
+  },
+  {
+   "from": "cutover-gate",
+   "body": "📄 updated room document “Cutover Scorecard”."
+  },
+  {
+   "from": "translator",
+   "body": "🛑 Governance gate: refused `preserve D-1 D-2 D-3 D-4 D-5` from agent fuzzer — only the human lead may decide what happens to a divergence. N"
+  },
+  {
+   "from": "translator",
+   "body": "📄 updated room document “Parity & Cutover Audit Ledger”."
+  },
+  {
+   "from": "cutover-gate",
+   "body": "🛑 Governance gate: refused — `approve-cutover` is a human-only command; the sender `translator` is a room agent, not the human lead. Nothing"
+  },
+  {
+   "from": "cutover-gate",
+   "body": "📄 updated room document “Cutover Scorecard”."
+  },
+  {
+   "from": "translator",
+   "body": "🛑 Governance gate: refused `please migrate /people/{user}/lists from legacy_openlibrary to FastAPI` from agent cutover-gate — only the human"
+  },
+  {
+   "from": "cutover-gate",
+   "body": "🛑 Governance gate: refused — `approve-cutover` is a human-only command; the sender `fuzzer` is a room agent, not the human lead. Nothing cha"
+  },
+  {
+   "from": "cutover-gate",
+   "body": "📄 updated room document “Cutover Scorecard”."
+  }
+ ]
+}
+
+## docker compose ports (upstream deploy/local/standalone-docker-compose.yml, switch-v0.31.0)
+switch:  "${SWITCH_BIND_ADDR:-127.0.0.1}:${API_HOST_PORT:-8000}:8000"
+gateway (profile gateway): "${SWITCH_BIND_ADDR:-127.0.0.1}:${GATEWAY_HOST_PORT:-3000}:3000"
+mattermost: "${SWITCH_BIND_ADDR:-127.0.0.1}:${MATTERMOST_HOST_PORT:-8065}:8065"
+
+## Switch PATCH /agents/{id} body (UpdateAgentRequest): description, integration_profile, metadata only (name/display_name immutable by the agent)
+## room history sender_name for agent messages = the agent's registered name (e.g. 'cutover-gate'), not its display name ('Cutover Gate')
+
+## make help
+Usage: make <target>
+
+Targets:
+  help               Show this help.
+  install            Create .venv with uv and install the pinned dependencies.
+  switch-up          Start the Switch + Mattermost stack.
+  switch-down        Stop the Switch + Mattermost stack.
+  targets            Start the legacy, modern and proxy targets.
+  provision          Register agents and create/reuse the migration room.
+  agents             Start the three agents.
+  agents-stop        Stop the three agents.
+  test               Run the fast test suite (non-integration).
+  test-integration   Run the live Switch integration tests.
+  e2e                Run the end-to-end demo from a fresh state.
+  demo               Full demo: Switch, fresh targets, provision, agents, e2e (in order).
+  cinema             Run the demo with cinematic pacing from a fresh state.
+  stop               Stop agents, targets and Switch.
+  clean-state        Stop agents+targets, then remove runtime state (keeps .state/switch.env).

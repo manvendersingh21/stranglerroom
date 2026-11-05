@@ -1,0 +1,5 @@
+{"task_id": "smoke-codex", "peer": "codex", "model": "gpt-6.1-sol", "effort": "low",
+ "summary": "text-mode smoke test", "prompt": "Write a Python module that defines def add(a, b): return a + b.",
+ "outputs": [".state/smoke/smoke_add.py"], "context": [],
+ "acceptance": [".venv/bin/python -c \"import importlib.util as u; s=u.spec_from_file_location('m','.state/smoke/smoke_add.py'); m=u.module_from_spec(s); s.loader.exec_module(m); assert m.add(2,3)==5\""],
+ "max_rework": 1, "timeout_s": 300}

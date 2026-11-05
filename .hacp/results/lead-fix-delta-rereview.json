@@ -1,0 +1,24 @@
+{
+  "task_id": "lead-fix-delta-rereview",
+  "session": "s-lead-fix-delta-rereview-750a10",
+  "ledger": ".hacp/sessions/s-lead-fix-delta-rereview-750a10.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-lead-fix-delta-rereview-750a10",
+  "revision": "68f462c83b8b0433990afdb0f0c69abbf84ee1e3195d314aef3302223973f04f",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/lead-fix-delta-rereview.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/lead-fix-delta-rereview.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/lead-fix-delta-rereview.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

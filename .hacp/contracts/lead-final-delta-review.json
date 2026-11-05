@@ -1,0 +1,28 @@
+{
+ "task_id": "lead-final-delta-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "independent review of the lead's final changes",
+ "prompt": "You are an adversarial senior reviewer. tmp_review/lead_delta.diff is the lead engineer's final set of changes (after all other reviews): (1) agents/bench.py rewritten as a closed-loop virtual-user load generator with a warm-up phase; (2) a per-deployment random proxy admin token (targets/common/router_token.py) used by targets/proxy/router.py and agents/cutover_agent.py instead of a public default; (3) agents/translator_agent.py: stale-message ties, migrate dedupe across superseded migrations, a requested_at fallback floor, and paged room-history lookup for approval verification (_scan_history); (4) SwitchAgent.read_context(before=...) and the matching FakeRoom semantics. Find REAL defects only: correctness bugs, regressions vs the previous behaviour shown in the diff, races, infinite loops, wrong time/units handling (epoch ms vs ISO), security weaknesses, and tests that would pass while the code is wrong. For each: severity, file:line, a concrete failing scenario, and the minimal fix. No style nits. Markdown with '## Findings' (write 'None.' if none) and '## Verdict'.",
+ "outputs": [
+  ".hacp/reviews/lead-final-delta.md"
+ ],
+ "context": [
+  "tmp_review/lead_delta.diff",
+  "agents/bench.py",
+  "targets/common/router_token.py",
+  "targets/proxy/router.py",
+  "agents/translator_agent.py",
+  "agents/switch_client.py",
+  "tests/fakes.py",
+  "tests/test_translator_history.py",
+  "docs/AGENTS_SPEC.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/lead-final-delta.md",
+  "grep -q '## Verdict' .hacp/reviews/lead-final-delta.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1500
+}

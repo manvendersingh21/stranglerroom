@@ -1,0 +1,27 @@
+{
+ "task_id": "lead-fix-delta-rereview",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "re-review of the fixes made in response to the previous review",
+ "prompt": "You are an adversarial senior reviewer doing a RE-REVIEW. tmp_review/fix_delta.diff contains only the fixes the lead made after the previous review round: (1) targets/common/router_token.py now has ONE rule shared by the proxy and @cutover-gate (ROUTER_ADMIN_TOKEN trimmed, else ROUTER_TOKEN_FILE, else <STRANGLER_STATE_DIR or repo/.state>/router.token) and publishes a new token atomically (mkstemp + os.link); router.py and cutover_agent.py both call it; (2) agents/translator_agent.py _scan_history pages back through Switch room history with an adaptive overlap window (starts 5000 ms, x2 when a page adds unseen ids, /4 when it adds none, stop when even a 0 ms strict cursor adds nothing; floor stop when oldest < not_before_ms - 5000; 200 reads max); Switch semantics: read_context returns the highest-seq rows whose sent_at < before (exclusive), newest last, truncated exact, oldest_timestamp = min sent_at in the page; (3) cutover_agent refuses `benchmark` while a cutover to non-legacy is active; (4) bench.py creates the virtual-user clients inside try and the card states min(concurrency,total) users. Verify each fix is CORRECT and COMPLETE, and look for regressions or new defects it introduced (termination/progress proofs for the scan, skipped messages, the floor margin, filesystem races on the token incl. stale temp files, symlinks, permissions, the benchmark guard blocking legitimate flows such as benchmarking after a rollback, tests that would pass if the code were wrong). For each finding: severity, file:line, concrete failing scenario, minimal fix. No style nits. Markdown with '## Findings' ('None.' if none) and '## Verdict'.",
+ "outputs": [
+  ".hacp/reviews/lead-fix-delta-rereview.md"
+ ],
+ "context": [
+  "tmp_review/fix_delta.diff",
+  "targets/common/router_token.py",
+  "targets/proxy/router.py",
+  "agents/translator_agent.py",
+  "agents/cutover_agent.py",
+  "agents/bench.py",
+  "tests/test_translator_history.py",
+  "tests/test_proxy.py"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/lead-fix-delta-rereview.md",
+  "grep -q '## Verdict' .hacp/reviews/lead-fix-delta-rereview.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1500
+}

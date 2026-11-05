@@ -1,0 +1,144 @@
+# StranglerRoom — Switch 0.31.0 version 2 room template (docs/AGENTS_SPEC.md §5)
+#
+# Creates the StranglerRoom migration room: the three StranglerRoom agents
+# (translator, fuzzer, cutover-gate) and you, bridged to the default messaging
+# app, for the strangler-fig migration of Open Library's legacy web.py lists
+# endpoints to FastAPI. Import it in Switch Console (Templates) and run it.
+#
+# Prerequisites
+#   * The three agents are already registered custom agents:
+#       python -m agents.provision
+#     The room lists them by name. They are deliberately NOT agent resources:
+#     those are created as managed agents, which needs Switch agent management
+#     and an enrolled controller machine.
+#   * Running agents (scripts/agents.sh start) serve only the room recorded in
+#     .state/room.json by python -m agents.provision. The default room name is
+#     that room's name, strangler-migration: archive the provisioned room before
+#     running this template with the default, or pick another room_name.
+#     Switch accepts a second active room of the same name, but its channel
+#     gets a suffix and agents.provision would then pick either room.
+#
+# Deliberately absent
+#   * No docs: the 'Parity & Cutover Audit Ledger', 'Parity Audit Matrix' and
+#     'Cutover Scorecard' each have a single writer, the agent that creates it;
+#     a template-created copy would be owned by you and lock the agents out.
+#   * No aliases, and no addressed participant in the kickoff or anywhere else
+#     in this file: nothing here may set an agent working.
+#
+# Check it with: .venv/bin/python scripts/validate_template.py [--run]
+
+version: 2
+
+params:
+  room_name:
+    type: string
+    label: Room name
+    description: >-
+      Name of the migration room, also its channel name on the messaging app
+      unless that channel name is taken, when the app adds a suffix. Lowercase
+      letters and digits in dash-separated words, 2 to 64 characters.
+    default: strangler-migration
+    pattern: "(?=.{2,64}$)[a-z0-9]+(?:-[a-z0-9]+)*"
+
+  bridge:
+    type: bridge
+    label: Messaging app
+    description: >-
+      Where the room is created: the server's default messaging app unless you
+      pick one. Only on a server with no messaging app at all is the room
+      internal to Switch, and then nobody is invited.
+    default: [$first]
+    required: false
+    input: advanced
+
+resources:
+  strangler_room:
+    type: room
+    name: "{room_name}"
+    description: >-
+      StranglerRoom: strangler-fig migration of Open Library's legacy web.py
+      lists endpoints to FastAPI by the translator, fuzzer and cutover-gate
+      agents, behind human-only governance gates.
+    bridge: "{bridge}"
+    channel_type: channel_public
+    agents: [translator, fuzzer, cutover-gate]
+    users:
+      - if: "{bridge}"
+        value: ["{$creator}"]
+      - value: []
+    instructions: |
+      StranglerRoom Migration Pipeline
+      =================================
+
+      This room orchestrates a strangler-fig migration of legacy web.py endpoints
+      to a modern FastAPI service. Three agents collaborate with a human lead
+      through a governed, auditable pipeline.
+
+      Pipeline Flow
+      -------------
+      1. The human lead sends the translator the migrate command, e.g.:
+         migrate /people/<user>/lists from legacy_openlibrary to FastAPI
+         This is a HUMAN-ONLY command.
+
+      2. The translator AST-introspects the legacy web.py lists module (no
+         import or execution), deploys v1 of the FastAPI service on :9002,
+         writes the 'Parity & Cutover Audit Ledger' and hands off to the fuzzer.
+
+      3. The fuzzer runs a differential shadow campaign comparing legacy :9001
+         vs modern :9002. It records results in the 'Parity Audit Matrix',
+         clusters divergences as D-1 through D-n, and asks the human lead
+         for decisions on each divergence.
+
+      4. The human lead replies to the translator with preserve and deprecate
+         decisions, e.g.: preserve D-1 D-2 D-4 and deprecate D-3 D-5
+         This is a HUMAN-ONLY command.
+
+      5. The translator patches v2 of the modern service incorporating the
+         human decisions. The fuzzer re-verifies to 100% approved parity and
+         hands off to the cutover-gate.
+
+      6. The cutover-gate benchmarks legacy vs modern (p50/p95/p99), records
+         the 'Cutover Scorecard' and asks the human for approval.
+
+      7. The human replies approve-cutover to flip the proxy :9000 from legacy
+         to modern, or rollback to revert. Both are HUMAN-ONLY commands.
+
+      8. After cutover the translator seals the hash-chained ledger.
+
+      Governance Rule
+      ---------------
+      The following commands are HUMAN-ONLY:
+        - migrate (to the translator)
+        - preserve/deprecate decisions (to the translator)
+        - approve-cutover (to the cutover-gate)
+        - rollback (to the cutover-gate)
+
+      When an agent sends a human-only command, the receiving agent refuses
+      it with a message starting "🛑 Governance gate", records the refusal in
+      its document and changes nothing. Every agent also answers status and
+      help, from anyone.
+
+      Document Ownership
+      ------------------
+      Each agent document has a single writer (its creating agent). The three
+      documents are the 'Parity & Cutover Audit Ledger' (translator), the
+      'Parity Audit Matrix' (fuzzer) and the 'Cutover Scorecard' (cutover-gate).
+      Any member may read them; only their writer may change them. This
+      template deliberately does not pre-create them.
+
+      Mention hygiene
+      ---------------
+      Addressing a participant sets it working. Agents address another agent
+      only in a deliberate handoff of the next pipeline step; when they need
+      the human they say which agent to reply to without addressing it.
+    kickoff: |
+      Welcome to the StranglerRoom migration room, created {$date}.
+
+      The three agents are ready: translator, fuzzer and cutover-gate.
+
+      To begin a migration, start a message with the translator's handle
+      followed by the migrate command, for example:
+      migrate /people/<user>/lists from legacy_openlibrary to FastAPI
+      Every decision after that waits for you: the preserve/deprecate choices
+      (to the translator) and approve-cutover or rollback (to the cutover-gate)
+      are human-only. The room instructions describe the whole pipeline.

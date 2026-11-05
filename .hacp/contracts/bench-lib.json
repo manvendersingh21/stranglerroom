@@ -1,0 +1,16 @@
+{
+ "task_id": "bench-lib",
+ "peer": "agy",
+ "model": "gemini-3.8-flash-high",
+ "effort": "high",
+ "summary": "Async load benchmark library for @cutover-gate",
+ "prompt": "Read docs/SPEC.md first; it is the binding contract. Use only the project venv (.venv/bin/python, .venv/bin/pytest); do not install new packages and do not modify files under tests/ or docs/. Keep code clean, typed, documented, and production quality. Do not touch .switch-infra/ or .native/. Implement agents/bench.py exactly matching the API documented in the module docstring of tests/test_bench.py (run_benchmark, compare, render_card, percentile, BenchResult dataclass). Use httpx.AsyncClient with limits matching concurrency and an asyncio.Semaphore; measure each request with time.perf_counter. percentile(values, p) = nearest-rank: sorted, index = ceil(p/100*n)-1 clamped, returns 0.0 for empty. render_card returns a Markdown table with rows p50/p95/p99/max/mean latency (ms, 1 decimal), throughput (req/s, 1 decimal), errors, and a delta column. Also add a small CLI: `python -m agents.bench URL [URL2] --total 500 --concurrency 50 --paths /a,/b` printing the card.",
+ "outputs": [
+  "agents/bench.py"
+ ],
+ "acceptance": [
+  ".venv/bin/pytest -q tests/test_bench.py"
+ ],
+ "max_rework": 2,
+ "timeout_s": 1800
+}

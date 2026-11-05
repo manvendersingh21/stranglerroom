@@ -1,0 +1,28 @@
+{
+ "task_id": "integration-tests-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "codex review of tests/test_parity_integration.py and tests/test_switch_integration.py (+ the classify rule-1 fix in agents/divergence.py)",
+ "prompt": "You are a senior reviewer of test code. Review the deliverables-under-review for real defects only: (1) tests/test_parity_integration.py -- end-to-end parity loop WITHOUT Switch: real legacy + modern targets on free ports (modern with uvicorn reloader ON serving MODERN_LISTS_PATH=tmp file), naive policy -> run_campaign must give exactly 5 clusters D-1..D-5 (json_suffix, loose_query, missing_resource_200, non_positive_quantity, empty_body_500), all open, approved False; DEMO policy + decisions on the same registry -> '100% Approved Parity (5/5)' with preserved-ok x3 / deprecated-ok x2; negative control all-preserve with D-3 deprecated -> deprecated-violated. (2) tests/test_switch_integration.py -- @pytest.mark.integration test of agents/switch_client.py against a live Switch 0.31.0 with throwaway agents, internal_only room, heartbeat > TTL, forced stream close + reconnect, cleanup in finally. (3) the rule-1 extension in agents/divergence.py classify() (legacy application 404 {error: not_found} vs modern routing 404 on a .json path -> json_suffix) and the matching change in tests/test_divergence.py test_classify_rule1_json_suffix. Look for: flaky timing / races (reloader pick-up, event waits, stream identity checks), assertions that could pass vacuously or fail for the wrong reason, isolation leaks (writing the real targets/modern_fastapi/app/lists.py, real .state/agents, fixed ports 9000-9002, leftover Switch agents/rooms on failure paths), cleanup that can be skipped or can mask the original failure, misuse of the switch_client API vs docs/SWITCH_PROTOCOL.md, mis-classification risks introduced by the classify change, and real defects in agents/switch_client.py that the test exposes. For each finding give: severity (high/medium/low), file:line, a concrete failure scenario, and the minimal fix. No style nits. Write the review as markdown with a '## Findings' section (write '## Findings\\n\\nNone.' if none) and a '## Verdict' line. Output exactly one file: .hacp/reviews/integration_tests.md.",
+ "outputs": [".hacp/reviews/integration_tests.md"],
+ "context": [
+  "tests/test_parity_integration.py",
+  "tests/test_switch_integration.py",
+  "tests/procs.py",
+  "tests/test_divergence.py",
+  "agents/switch_client.py",
+  "agents/divergence.py",
+  "agents/codegen/fastapi_lists.py",
+  "targets/modern_fastapi/server.py",
+  "targets/modern_fastapi/app/main.py",
+  "docs/SPEC.md",
+  "docs/SWITCH_PROTOCOL.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/integration_tests.md",
+  "grep -q '## Verdict' .hacp/reviews/integration_tests.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

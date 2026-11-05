@@ -1,0 +1,13 @@
+{
+ "task_id": "ci-workflow",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "GitHub Actions workflow .github/workflows/e2e.yml for StranglerRoom",
+ "prompt": "Write .github/workflows/e2e.yml so that tests/test_ci_workflow.py passes (read it first; it is the acceptance test). Requirements from docs/AGENTS_SPEC.md section 6. Workflow name 'e2e'. Triggers: push (all branches), pull_request, workflow_dispatch. permissions: contents: read. concurrency: group '${{ github.workflow }}-${{ github.ref }}', cancel-in-progress: true. Two jobs on ubuntu-latest. Job 'unit' (timeout-minutes 15): actions/checkout@v4, actions/setup-python@v5 with python-version '3.12', astral-sh/setup-uv@v6 (enable-cache: true), run 'make install', run 'make test'. Job 'e2e' (needs: unit, timeout-minutes: 45): same checkout/setup-python/setup-uv, then step 'Bootstrap Switch 0.31.0 (docker)' with env SWITCH_MODE: docker running 'scripts/bootstrap_switch.sh' (timeout-minutes 20; the script clones sandbox-quantum/switch into .switch-infra, pins SWITCH_VERSION=0.31.0, runs the upstream compose with --profile collab --profile gateway, waits for API :8000, Mattermost :18065 and the setup container to exit 0, then writes .state/switch.env which the agents and the demo driver read -- never print or upload that file); step 'make install'; step 'Provision agents and room' run 'make provision' (the e2e driver only provisions with --fresh, and a fresh CI stack has no registered agents/room); step 'Run end-to-end demo' run 'make e2e' (timeout-minutes 20). On failure: a step with 'if: failure()' that does 'mkdir -p .state/ci' then runs `docker compose -f .switch-infra/deploy/local/standalone-docker-compose.yml --project-directory .switch-infra --profile collab --profile gateway logs --no-color --timestamps > .state/ci/compose.log 2>&1 || true` (also `... ps -a >> .state/ci/compose.log 2>&1 || true` is welcome, as a separate line prior), then actions/upload-artifact@v4 with if: failure(), name 'e2e-logs', path as a multi-line block listing exactly '.state/run/*.log' and '.state/ci/compose.log', if-no-files-found: warn, retention-days: 7. Use plain 'run:' lines for make commands such that each make invocation is alone on its line (tests match lines). Keep comments concise. Output only the file.",
+ "outputs": [".github/workflows/e2e.yml"],
+ "context": ["docs/AGENTS_SPEC.md", "scripts/bootstrap_switch.sh", "scripts/targets.sh", "tests/test_ops_scripts.py", "tests/test_ci_workflow.py"],
+ "acceptance": [".venv/bin/pytest -q tests/test_ci_workflow.py"],
+ "max_rework": 2,
+ "timeout_s": 1500
+}

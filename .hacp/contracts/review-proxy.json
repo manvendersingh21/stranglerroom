@@ -1,0 +1,23 @@
+{
+ "task_id": "review-proxy",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "codex review of targets/proxy/router.py",
+ "prompt": "You are a senior reviewer. Review the deliverable-under-review below for real defects only: correctness bugs, spec violations (docs/SPEC.md), concurrency/resource leaks, error handling that hides failures, security issues (e.g. token comparison, header injection, hop-by-hop handling), and test gaps. For each finding give: severity (high/medium/low), file:line, what breaks (a concrete failure scenario), and the minimal fix. Do not list style nits. Write the review as markdown with a '## Findings' section (write '## Findings\\n\\nNone.' if there are none) and a '## Verdict' line. Deliverable under review: targets/proxy/router.py (strangler reverse proxy :9000 with token-gated flip, SPEC section 6).",
+ "outputs": [
+  ".hacp/reviews/proxy_router.md"
+ ],
+ "context": [
+  "targets/proxy/router.py",
+  "tests/test_proxy.py",
+  "tests/fake_upstream.py",
+  "docs/SPEC.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/proxy_router.md",
+  "grep -q '## Verdict' .hacp/reviews/proxy_router.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1200
+}

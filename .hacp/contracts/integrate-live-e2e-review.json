@@ -1,0 +1,29 @@
+{
+ "task_id": "integrate-live-e2e-review",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "Adversarial review of the live e2e integration: driver, ops scripts and the real Switch+Mattermost transcript",
+ "prompt": "You are an adversarial reviewer of the StranglerRoom LIVE end-to-end integration. Three Switch room agents (agents/translator_agent.py, agents/fuzzer_agent.py, agents/cutover_agent.py) and a human lead migrate Open Library's legacy web.py lists endpoints to FastAPI in the Switch 0.31.0 room `strangler-migration`, bridged to Mattermost. The Definition of Done is: `scripts/run_e2e_demo.py --fresh` completes the 8-step loop of docs/AGENTS_SPEC.md section 3 with exit code 0 against the REAL stack. It now does. Inlined below you get: the driver (scripts/run_e2e_demo.py), the ops scripts it runs in pre-flight (scripts/targets.sh, scripts/agents.sh), the agents' command grammar (agents/commands.py), the translator's and the cutover gate's code, the binding spec (docs/AGENTS_SPEC.md) and the Switch API notes (docs/SWITCH_PROTOCOL.md), plus TWO artefacts of a real passing run: the driver's console output (e2e_run2.log) and the complete Mattermost channel transcript of that run (channel_run2_full.txt: one `--- <create_at ms> <username> len=… mentions=[…]` header per post, then the post text).\n\nTwo fixes were made during integration: (1) scripts/targets.sh svc() used to background `cd \"$ROOT\" && nohup … &` as a list, i.e. in a wrapper bash subshell that kept the driver's captured stdout/stderr pipes open, so the driver's pre-flight `subprocess.run(capture_output=True)` hung until its 300 s timeout; now only the fully redirected nohup command is backgrounded. (2) The driver's check_ledger() now also requires `cutover.approval_message_verified is True` (the translator found the approval message in read_context), that the trail's single `cutover-approved` entry attributes that message id to the human, and that it equals the message id the cutover gate announced in its 🚦 post.\n\nYOUR JOB: try to break it. Find (a) ways the driver could exit 0 although the loop did NOT really happen as specified (false PASS), e.g. matching the wrong post, an anchor/window bug, a check that is vacuous on the live data, a forbid list that misses a wrong outcome, the governance probe passing without a real refusal; (b) ways it can fail spuriously on the live stack (flakiness): races between the bridge's post ordering and the agents' sequential event handling (look at the real timestamps in the transcript: e.g. the cutover gate handles the benchmark for ~9 s before the probe; Switch posts its own join greetings that @-mention the agents; 📄 document notices), timeouts on a loaded 4-core box, settle_room, Mattermost `since` semantics, emoji variation selectors, the post that carries the approval message id; (c) mention-hygiene violations visible in the real transcript (an agent post that addresses ANOTHER agent outside a deliberate handoff, or quoting text that addresses someone); (d) ops-script defects in scripts/targets.sh / scripts/agents.sh (pid files, stop/start races, a stale process surviving `--fresh`, anything that would make two consecutive `--fresh` runs or a `--cinema --fresh` run differ); (e) anything in the sealed-ledger checks that the real translator could legitimately produce but the driver would reject, or vice versa.\n\nRules: only report defects you can tie to a concrete line (file:line from the inlined text) AND a concrete failing scenario (inputs/state -> wrong result). Do not report style. Rank by severity. For each finding give: severity (critical/high/medium/low), file:line, the scenario, and a minimal fix. If something you suspected turns out fine on the real transcript, list it briefly under '## Checked and fine'.\n\nDeliverable: .hacp/reviews/integrate-live-e2e.md with sections '## Findings' (numbered, most severe first; write 'None' if you find nothing) and '## Checked and fine'.",
+ "outputs": [
+  ".hacp/reviews/integrate-live-e2e.md"
+ ],
+ "context": [
+  "scripts/run_e2e_demo.py",
+  "scripts/targets.sh",
+  "scripts/agents.sh",
+  "agents/commands.py",
+  "agents/translator_agent.py",
+  "agents/cutover_agent.py",
+  "docs/AGENTS_SPEC.md",
+  "docs/SWITCH_PROTOCOL.md",
+  "/tmp/claude-0/-root-another-hackathon/41671522-265f-4090-a55b-52ffb2ec73d0/scratchpad/e2e_run2.log",
+  "/tmp/claude-0/-root-another-hackathon/41671522-265f-4090-a55b-52ffb2ec73d0/scratchpad/channel_run2_full.txt"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/integrate-live-e2e.md",
+  "grep -q '## Checked and fine' .hacp/reviews/integrate-live-e2e.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

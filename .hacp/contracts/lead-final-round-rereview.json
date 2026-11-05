@@ -1,0 +1,25 @@
+{
+ "task_id": "lead-final-round-rereview",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "re-review of the final fix round",
+ "prompt": "You are an adversarial senior reviewer doing the FINAL re-review. tmp_review/final_round.diff contains the last fixes: (1) agents/cutover_agent.py records approval_timestamp_ms = the approval event's Switch timestamp (payload.timestamp == sent_at epoch ms) in the cutover record; (2) agents/translator_agent.py _lookup_approval first reads ONE page read_context(limit=500, before=iso(ts+1)) and checks the approval there (the found message must still be the approver's own approve-cutover and not older than the build floor), else falls back to _scan_history, whose cursor now strictly decreases every read (adaptive overlap, never forward); (3) targets/common/router_token.py reads tokens only from a regular non-symlink file owned by the current uid with no group/other bits (O_NOFOLLOW + fstat) and fsyncs a new token before os.link publishes it; (4) tests/fakes.py FakeRoom.read_context now reports the page MINIMUM timestamp and clamps limit to 1..500 like Switch. Switch semantics: read_context returns the highest-seq rows with sent_at < before (exclusive), newest last, truncated exact, oldest_timestamp = min sent_at of the page. Verify correctness and completeness; look for regressions/new defects (e.g. ts=None/bool/float handling, ts+1 boundary, timezone, a gate that is a different agent faking the timestamp, the fallback's termination proof, the token checks breaking the existing live .state/router.token or tests, fsync on the right object). Report ONLY defects you can demonstrate with a concrete scenario: severity, file:line, scenario, minimal fix. No style nits. Markdown with '## Findings' ('None.' if none) and '## Verdict'.",
+ "outputs": [
+  ".hacp/reviews/lead-final-round-rereview.md"
+ ],
+ "context": [
+  "tmp_review/final_round.diff",
+  "agents/translator_agent.py",
+  "agents/cutover_agent.py",
+  "targets/common/router_token.py",
+  "tests/fakes.py",
+  "tests/test_translator_history.py"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/lead-final-round-rereview.md",
+  "grep -q '## Verdict' .hacp/reviews/lead-final-round-rereview.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1500
+}

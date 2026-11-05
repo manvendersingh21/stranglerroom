@@ -1,0 +1,22 @@
+# Critic hardening changes (2026-11-05) to review
+
+1. agents/runtime.py RoomAgent.classify: kind "human" only for a participant of type "user" whose name equals
+   RoomInfo.human (case-insensitive); other "user" participants are "guest"; a name that two participants share after
+   lower-casing with different types is "unknown". Sender.is_human is unchanged (kind == "human").
+2. agents/cutover_agent.py:
+   - _approve: after the replay-by-message-id check, `_predates_last_flip(event, router)` (router = /_router/status;
+     approval Switch timestamp ms < router flipped_at -> ℹ️ refusal) and `_require_approval_after_benchmark(event, bm)`
+     (approval timestamp < latest benchmark "at" (ISO, truncated to seconds) -> PreconditionFailed ⚠️).
+   - _rollback: after the "already on legacy" no-op branches, `_predates_last_flip(event, current)` -> ℹ️ refusal.
+   - _refuse: guest wording.
+3. agents/translator_agent.py:
+   - _record_cutover: new problems: approver not the lead; no approval_message_id; cut["verified"] is not True;
+     `_check_approval(cut, not_before=builds[-1].at)` must return verified True, else refuse to seal (⚠️ cannot seal).
+   - _find_approval: approval message timestamp must be >= not_before (latest build time).
+   - module function _sent_before(event, ref_ms) + migration["request_timestamp"] (Switch ms of the migrate message):
+     _migrate refuses (ℹ️) a request older than the current ledger's request; _decide refuses (ℹ️) decisions older
+     than the current migration's request.
+4. scripts/bootstrap_switch.sh native: `exec nohup …&` so the pid file holds the server; native_down pid-verifies via
+   /proc/<pid>/cmdline, TERM then KILL, and never stops Postgres while an untracked server still runs.
+Clocks: Switch message timestamps vs agent now_iso()/router flipped_at — all processes on one host (native) or
+containers sharing the host kernel clock (CI docker).

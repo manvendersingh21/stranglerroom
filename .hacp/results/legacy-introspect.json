@@ -1,0 +1,19 @@
+{
+  "task_id": "legacy-introspect",
+  "session": "s-legacy-introspect-6ea87c",
+  "ledger": ".hacp/sessions/s-legacy-introspect-6ea87c.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-legacy-introspect-6ea87c",
+  "revision": "086afe42fea3b68aebaf13efdef11766014c576167645c1068f4b0d087404d99",
+  "verdict": "settled",
+  "merged": [
+    "agents/legacy_introspect.py"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": ".venv/bin/pytest -q tests/test_legacy_introspect.py",
+      "passed": true,
+      "tail": ".....                                                                    [100%]\n"
+    }
+  ]
+}

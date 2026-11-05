@@ -1,0 +1,24 @@
+{
+  "task_id": "integrate-live-e2e-review",
+  "session": "s-integrate-live-e2e-review-53d644",
+  "ledger": ".hacp/sessions/s-integrate-live-e2e-review-53d644.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-integrate-live-e2e-review-53d644",
+  "revision": "0909b84419a908a67e840eb2428bbd3b8aca4f1a70373a765b8a8cd48945bad5",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/integrate-live-e2e.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/integrate-live-e2e.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Checked and fine' .hacp/reviews/integrate-live-e2e.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

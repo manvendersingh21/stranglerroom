@@ -1,0 +1,24 @@
+{
+  "task_id": "critic-dod-audit-review",
+  "session": "s-critic-dod-audit-review-017bc9",
+  "ledger": ".hacp/sessions/s-critic-dod-audit-review-017bc9.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-critic-dod-audit-review-017bc9",
+  "revision": "02e984965424b67dba79dc25ae9d7709dc92039d3908cfc558ecfcaf712451eb",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/critic-dod-audit.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/critic-dod-audit.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verified OK' .hacp/reviews/critic-dod-audit.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

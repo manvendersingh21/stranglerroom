@@ -1,0 +1,19 @@
+{
+  "task_id": "cutover-proxy-control",
+  "session": "s-cutover-proxy-control-f19174",
+  "ledger": ".hacp/sessions/s-cutover-proxy-control-f19174.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-cutover-proxy-control-f19174",
+  "revision": "85ff9761f594cb743aadb7a6d3a4764398d7fd283cb89da4593afa64bdefd1d2",
+  "verdict": "settled",
+  "merged": [
+    "agents/proxy_control.py"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": ".venv/bin/pytest -q tests/test_proxy_control.py",
+      "passed": true,
+      "tail": "............                                                             [100%]\n"
+    }
+  ]
+}

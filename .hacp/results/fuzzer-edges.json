@@ -1,0 +1,19 @@
+{
+  "task_id": "fuzzer-edges",
+  "session": "s-fuzzer-edges-35aa0e",
+  "ledger": ".hacp/sessions/s-fuzzer-edges-35aa0e.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-fuzzer-edges-35aa0e",
+  "revision": "8669ca4b7bb5cda9b655e411f05fe836757f4a3b6d38e81323c14d0deefdb1b8",
+  "verdict": "settled",
+  "merged": [
+    "tests/test_fuzzer_agent_edges.py"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": ".venv/bin/pytest -q tests/test_fuzzer_agent_edges.py",
+      "passed": true,
+      "tail": "............                                                             [100%]\n"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "task_id": "critic-hardening-review",
+  "session": "s-critic-hardening-review-6fce2d",
+  "ledger": ".hacp/sessions/s-critic-hardening-review-6fce2d.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-critic-hardening-review-6fce2d",
+  "revision": "3b48ebec79714debda2f3a7614b67e6726ce9fad26c4b1dc111a335b7344b06a",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/critic-hardening.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/critic-hardening.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

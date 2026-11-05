@@ -1,0 +1,31 @@
+{
+  "task_id": "ops-scripts",
+  "session": "s-ops-scripts-193014",
+  "ledger": ".hacp/sessions/s-ops-scripts-193014.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-ops-scripts-193014",
+  "revision": "47a1e09ee8a0f96d3fa473b096c3d20ee79f31091e128698cdf14581cfb2a450",
+  "verdict": "settled",
+  "merged": [
+    "scripts/agents.sh",
+    "Makefile",
+    "requirements.txt"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": ".venv/bin/pytest -q tests/test_ops_scripts.py",
+      "passed": true,
+      "tail": "...                                                                      [100%]\n"
+    },
+    {
+      "check": "bash -n scripts/agents.sh",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "make -n help demo cinema e2e restart-check >/dev/null 2>&1 || make -n help demo cinema e2e >/dev/null",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}
