@@ -44,7 +44,10 @@ log = logging.getLogger("strangler.switch")
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = Path(os.environ.get("STRANGLER_STATE_DIR", str(ROOT / ".state")))
 
-DEFAULT_SWITCH_URL = "http://localhost:18000"
+# An IP literal, never "localhost": on hosts where localhost resolves to ::1 first while Switch listens on
+# 127.0.0.1 only, any local user could bind [::1]:18000 and receive every client's credentials
+# (docs/ISOLATION.md §1).
+DEFAULT_SWITCH_URL = "http://127.0.0.1:18000"
 HEARTBEAT_INTERVAL_S = 2.0
 STREAM_READ_TIMEOUT_S = 45.0  # server keepalives arrive every 15 s of idle
 

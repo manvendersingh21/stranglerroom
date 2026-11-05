@@ -101,7 +101,7 @@ write_state_env() {
   mkdir -p "$STATE"
   touch "$STATE/switch.env" && chmod 600 "$STATE/switch.env"  # 0600 before the secrets are written
   cat >"$STATE/switch.env" <<EOF
-SWITCH_URL=http://localhost:${API_PORT}
+SWITCH_URL=http://127.0.0.1:${API_PORT}
 MATTERMOST_URL=http://localhost:${MM_PORT}
 AGENT_REGISTRATION_TOKEN=${AGENT_REGISTRATION_TOKEN}
 GATEWAY_ADMIN_EMAIL=${GATEWAY_ADMIN_EMAIL}
@@ -114,7 +114,7 @@ MATTERMOST_ADMIN_PASSWORD=${MATTERMOST_ADMIN_PASSWORD}
 EOF
   chmod 600 "$STATE/switch.env"
   # The public part (no secret): all an agent process needs. Agents read this file, never switch.env.
-  printf 'SWITCH_URL=http://localhost:%s\nMATTERMOST_URL=http://localhost:%s\n' "$API_PORT" "$MM_PORT" \
+  printf 'SWITCH_URL=http://127.0.0.1:%s\nMATTERMOST_URL=http://localhost:%s\n' "$API_PORT" "$MM_PORT" \
     >"$STATE/connection.env"
   chmod 644 "$STATE/connection.env"
   log "wrote .state/switch.env and .state/connection.env"
