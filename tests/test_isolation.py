@@ -87,6 +87,10 @@ def main():
         "env": dict(os.environ), "cmdline": open("/proc/self/cmdline", "rb").read().decode(errors="replace"),
         "status": open("/proc/self/status").read(), "reach": reach,
     }
+    if "--child" in args and os.fork() == 0:  # a descendant, like uvicorn's reload worker
+        os.close(1)
+        time.sleep(60)
+        os._exit(0)
     os.write(1, json.dumps(info).encode())
     if "--sleep" in args:
         os.close(1)
@@ -387,7 +391,7 @@ PARENT_ENV = {
     "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC", "TERM": "xterm",
     "PYTHONUNBUFFERED": "1", "STRANGLER_LOG_LEVEL": "DEBUG", "STRANGLER_AGENT_PACE": "0.5",
     "LEGACY_URL": "http://127.0.0.1:9001", "MODERN_URL": "http://127.0.0.1:9002", "PROXY_URL": "http://127.0.0.1:9000",
-    "STRANGLER_TRANSLATOR_MODE": "llm", "STRANGLER_LLM_CMD": "claude -p", "MODERN_NO_RELOAD": "1",
+    "STRANGLER_TRANSLATOR_MODE": "llm", "STRANGLER_LLM_CMD": "true -p", "MODERN_NO_RELOAD": "1",
     "STRANGLER_TRANSLATOR_PASS_ENV": "ANTHROPIC_API_KEY, OTHER_LLM_KEY",
     "ANTHROPIC_API_KEY": "sk-ant-secret", "OTHER_LLM_KEY": "other-secret", "GH_TOKEN": "gh-secret",
     "GATEWAY_ADMIN_PASSWORD": "gw-secret", "MATTERMOST_USER_PASSWORD": "mm-secret", "ROUTER_ADMIN_TOKEN": "root-token",
@@ -1023,16 +1027,16 @@ def test_scan_lists_links_as_root_but_resolves_them_only_as_the_user(world_tmp):
     assert all(not d.startswith(str(scan / "linked")) for d, _ in candidates)  # root never walked the alias
     started = time.monotonic()
     result = iso.run_as(iso.Ids(NOBODY, NOBODY), iso.search_readable, candidates, {"n": b"needle-0123456789"})
-    assert time.monotonic() - started < 10 and result["truncated"] is False
+    assert time.monotonic() - started < 10 and result["truncated"] == []
     assert sorted(h[0] for h in result["hits"]) == [str(scan / "file-link"),
                                                      str(scan / "linked" / "deep" / "backup.json")]
     # a candidate swapped for a FIFO after the listing is never opened for reading
     result = iso.run_as(iso.Ids(NOBODY, NOBODY), iso.search_readable, [(str(scan / "sub"), ["fifo"])], {})
-    assert result == {"read": 0, "hits": [], "truncated": False}
+    assert result == {"read": 0, "hits": [], "truncated": []}
     # the caps bound a walk through links; hitting them is reported
     result = iso.run_as(iso.Ids(NOBODY, NOBODY), lambda: iso.search_readable(
         [(str(scan), ["linked"])], {"n": b"needle-0123456789"}, link_max_files=0))
-    assert result["truncated"] is True
+    assert result["truncated"] and "symlinked directories" in result["truncated"][0]
 
 
 @requires_root
@@ -1077,7 +1081,7 @@ def test_secret_values_collects_every_kind(world_tmp, checkout):
     assert values["switch.env:GATEWAY_ADMIN_PASSWORD"] == SWITCH_SECRETS["GATEWAY_ADMIN_PASSWORD"]
     assert values[".switch-infra/.env:DB_PASSWORD"] == "db-pass-000111"
     assert values[".switch-infra/.env:SECRET_KEYS[1]"] == "ccccccccdddddddd"
-    assert values["mattermost-db-password"] == "mm@pass-xyz"
+    assert values["mattermost-db-password:mm-env.sh"] == "mm@pass-xyz"
     assert not any("SWITCH_URL" in k or "VERSION" in k or "EMAIL" in k for k in values)
 
 
@@ -1097,7 +1101,7 @@ def test_process_checks_on_a_live_isolated_component(world_tmp, checkout):
         by_check = {r.check: r.status for r in rows if r.subject == "proxy"}
         assert all(s == "PASS" for s in by_check.values()), rows
         assert any("own session" in c for c in by_check) and any("ROUTER_ADMIN_TOKEN" in c for c in by_check)
-        assert any("tracked instance" in c for c in by_check)
+        assert not any("unexplained" in c or "tracked instance" in c for c in by_check)
         assert [r.status for r in rows if r.subject == "legacy"] == ["SKIP"]
         # the same process judged as if it were the legacy server: it must not hold the token
         rows = iso.process_checks({"legacy": ids_for("proxy")}, {"router.token": ROUTER_TOKEN}, {}, instances={})
@@ -1270,13 +1274,15 @@ def test_scripts_launch_through_the_isolation_prefix_and_decide_the_mode_first()
         assert mode_at < text.index('mkdir -p "$RUN"') and mode_at < text.index('exec 9>"$RUN/')
         assert 'ISOLATE=""' in text and "on) ISOLATE=1 ;;" in text
     assert 'RUN="$STATE/run"' in targets and 'RUN="${STRANGLER_RUN_DIR:-$STATE/run}"' in agents
-    state_line = 'STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"'
-    assert state_line in targets and state_line in agents
+    assert 'STATE="$(resolve_path "${STRANGLER_STATE_DIR:-$ROOT/.state}" home)"' in targets
+    assert 'STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"' in agents
     fresh = targets[targets.index('if [ "${2:-}" = "--fresh" ]'):targets.index('echo "starting targets"')]
+    assert "fresh_reset" in fresh  # behaviour: test_fresh_reset_resolves_overrides_like_the_processes
+    reset = _function(ROOT / "scripts/targets.sh", "fresh_reset")
     for part in ('"${MODERN_LISTS_PATH:-$ROOT/targets/modern_fastapi/app/lists.py}"',
-                 '"${ROUTER_STATE_FILE:-$STATE/proxy/router.json}"', '"$STATE/fuzzer/divergence_registry.json"',
+                 '"${ROUTER_STATE_FILE:-$STATE/proxy/router.json}" home', '"$STATE/fuzzer/divergence_registry.json"',
                  '"$STATE/fuzzer/divergence_registry.json.staging"', '-m agents.isolation reset'):
-        assert part in fresh
+        assert part in reset
 
 
 def test_make_targets_for_isolation():
@@ -1406,20 +1412,39 @@ def test_isolated_listener_reads_the_socket_owner(fake_module):
     assert subprocess.run(["bash", "-c", harness], timeout=30).returncode == 1  # no listener at all
 
 
-def test_stop_one_isolated_also_kills_strays_of_the_service_user(tmp_path):
+@pytest.mark.parametrize("mode_vars", ["ISOLATE=1 MODE_UNKNOWN=", "ISOLATE= MODE_UNKNOWN=1"])
+def test_stop_one_isolated_also_kills_strays_of_the_service_user(tmp_path, mode_vars):
     calls = tmp_path / "calls"
     harness = "\n".join([
-        "set -euo pipefail", f"RUN={shlex.quote(str(tmp_path))}", "ISOLATE=1",
-        f"pkill() {{ echo \"$*\" >>{shlex.quote(str(calls))}; }}",
+        "set -euo pipefail", f"RUN={shlex.quote(str(tmp_path))}", mode_vars,
+        f"kill_service_user() {{ echo \"$*\" >>{shlex.quote(str(calls))}; }}",
         _function(ROOT / "scripts/targets.sh", "is_target_pid", "stop_one"),
         "echo 999999 >\"$RUN/legacy.pid\"", "stop_one legacy targets.legacy_openlibrary.server 9001"])
     proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
-    assert calls.read_text().splitlines() == ["-KILL -u sr-legacy"]
-    agents = (ROOT / "scripts/agents.sh").read_text()
-    assert 'pkill -KILL -u "sr-$name"' in _function(ROOT / "scripts/agents.sh", "stop_all")
-    assert 'if [ -n "$ISOLATE" ]; then umask 077; fi' in agents
-    assert 'if [ -n "$ISOLATE" ]; then umask 077; fi' in (ROOT / "scripts/targets.sh").read_text()
+    assert calls.read_text().splitlines() == ["sr-legacy"]  # (a stub: the default prefix names no process here)
+    assert 'kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name"' in _function(ROOT / "scripts/agents.sh",
+                                                                                        "stop_all")
+    for script in ("scripts/agents.sh", "scripts/targets.sh"):
+        assert 'if [ -n "$ISOLATE" ]; then umask 077; fi' in (ROOT / script).read_text()
+
+
+@pytest.mark.parametrize("script", ["scripts/targets.sh", "scripts/agents.sh"])
+def test_kill_service_user_repeats_until_none_is_left_then_reports(tmp_path, script):
+    """Scripts 10a: pkill is repeated (bounded) until pgrep finds no process of the user; survivors are reported."""
+    for survivors_after, expect_warning in ((3, False), (999, True)):
+        count = tmp_path / f"count-{survivors_after}"
+        count.write_text("0")
+        harness = "\n".join([
+            "set -euo pipefail", "id() { return 0; }", "sleep() { :; }",
+            f"pkill() {{ n=$(cat {count}); echo $((n + 1)) >{count}; }}",
+            f"pgrep() {{ [ \"$(cat {count})\" -lt {survivors_after} ] && echo 4242; "
+            f"[ \"$(cat {count})\" -lt {survivors_after} ]; }}",
+            _function(ROOT / script, "kill_service_user"), "kill_service_user sr-legacy"])
+        proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        assert int(count.read_text()) == min(survivors_after, 50)
+        assert ("survive repeated KILL" in proc.stderr) == expect_warning, proc.stderr
 
 
 @pytest.mark.parametrize("marker_repo, error", [("/elsewhere", "belongs to /elsewhere"), (None, "no marker")])
@@ -1536,13 +1561,15 @@ def test_listener_checks_cover_both_families_and_every_owner():
 def test_llm_cli_check_as_the_translator(world_tmp):
     """Opus #3: in LLM mode the CLI must run for sr-translator and only root may be able to change it."""
     ids = ids_for("translator")
-    assert iso.llm_cli_check(ids, {"PATH": "/usr/bin:/bin"}).status == "SKIP"  # deterministic by default
-    llm = {"PATH": "/usr/bin:/bin", "STRANGLER_TRANSLATOR_MODE": "llm"}
-    ok = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": "true --flag"})
+    paths = iso.service_paths(world_tmp / "srv")
+    assert iso.llm_cli_check(ids, paths, {"PATH": "/usr/bin:/bin"}).status == "SKIP"  # deterministic by default
+    # root's PATH is irrelevant: the translator's real child environment (fixed service PATH) decides
+    llm = {"PATH": f"{world_tmp}:/usr/bin", "STRANGLER_TRANSLATOR_MODE": "llm"}
+    ok = iso.llm_cli_check(ids, paths, {**llm, "STRANGLER_LLM_CMD": "true --flag"})
     assert ok.status == "PASS" and ok.actual.endswith("/true")
-    missing = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": "no-such-llm-cli-xyz -p"})
+    missing = iso.llm_cli_check(ids, paths, {**llm, "STRANGLER_LLM_CMD": "no-such-llm-cli-xyz -p"})
     assert missing.status == "FAIL" and "install the LLM CLI outside /root" in missing.actual
-    unreachable = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": "/root/.local/bin/claude -p"})
+    unreachable = iso.llm_cli_check(ids, paths, {**llm, "STRANGLER_LLM_CMD": "/root/.bashrc -p"})
     assert unreachable.status == "FAIL"
     tools = world_tmp / "tools"
     tools.mkdir()
@@ -1550,7 +1577,7 @@ def test_llm_cli_check_as_the_translator(world_tmp):
     cli.write_text("#!/bin/sh\n")
     cli.chmod(0o755)
     os.chown(tools, ids.uid, ids.gid)  # the translator could swap its own CLI: refused
-    mutable = iso.llm_cli_check(ids, {**llm, "STRANGLER_LLM_CMD": str(cli)})
+    mutable = iso.llm_cli_check(ids, paths, {**llm, "STRANGLER_LLM_CMD": str(cli)})
     assert mutable.status == "FAIL" and "owned by uid" in mutable.actual
 
 
@@ -1743,14 +1770,527 @@ def test_isolated_svc_makes_an_older_log_private(fake_module):
     assert stat.S_IMODE(log.stat().st_mode) == 0o600 and "older" not in log.read_text()
 
 
+TEST_USER_PREFIX = "srtest-"  # names no real user: the scripts' service users become srtest-<name>
+
+
+def _no_real_kills(tmp_path: Path) -> tuple[dict, Path]:
+    """The environment for running the REAL scripts with isolation on or in "mode unknown", whose stop kills every
+    service user's processes, on a host that may run a live isolated stack as sr-* users:
+    * STRANGLER_SERVICE_USER_PREFIX=srtest-: the service users the scripts act on do not exist;
+    * recording stand-ins for pkill, pgrep and id first on PATH, and for the `kill` builtin through BASH_ENV (a PATH
+      entry cannot replace a builtin). They only record; id knows only srtest-* users; pgrep finds nothing."""
+    bin_dir = tmp_path / "stub-bin"
+    bin_dir.mkdir(exist_ok=True)
+    calls = tmp_path / "kill-calls"
+    record = f'echo "$(basename "$0") $*" >>{shlex.quote(str(calls))}'
+    stubs = {
+        "pkill": f"#!/bin/sh\n{record}\nexit 0\n",
+        "pgrep": f"#!/bin/sh\n{record}\nexit 1\n",
+        "id": f'#!/bin/sh\ncase "$*" in *{TEST_USER_PREFIX}*) echo 4242424 ;; *) exit 1 ;; esac\n',
+    }
+    for name, body in stubs.items():
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    bash_env = tmp_path / "stub-bash-env"
+    bash_env.write_text(f'kill() {{ echo "kill $*" >>{shlex.quote(str(calls))}; return 1; }}\n')
+    return {"PATH": f"{bin_dir}:{os.environ['PATH']}", "BASH_ENV": str(bash_env),
+            "STRANGLER_SERVICE_USER_PREFIX": TEST_USER_PREFIX}, calls
+
+
 @pytest.mark.parametrize("script", ["targets.sh", "agents.sh"])
 def test_scripts_stop_before_touching_the_run_dir_when_the_mode_is_misconfigured(tmp_path, script):
-    """Behavioural companion of the structural test: with isolation on and no marker, the script exits 2 before it
-    creates or locks anything."""
+    """Behavioural companion of the structural test: with isolation on and no marker, start exits 2 before it creates
+    or locks anything; stop and status still work (scripts 10b), warn, and create nothing either."""
     state = tmp_path / "state"
-    env = {**os.environ, "STRANGLER_ISOLATION": "on", "STRANGLER_ISOLATION_MARKER": str(tmp_path / "none.json"),
+    stub_env, calls = _no_real_kills(tmp_path)
+    env = {**os.environ, **stub_env, "STRANGLER_ISOLATION": "on",
+           "STRANGLER_ISOLATION_MARKER": str(tmp_path / "none.json"),
            "STRANGLER_STATE_DIR": str(state), "STRANGLER_RUN_DIR": str(state / "run")}
-    proc = subprocess.run(["bash", str(ROOT / "scripts" / script), "status"], env=env, capture_output=True,
-                          text=True, timeout=60)
-    assert proc.returncode == 2 and "no marker" in proc.stderr, proc.stderr
+
+    def run(cmd):
+        return subprocess.run(["bash", str(ROOT / "scripts" / script), cmd], env=env, capture_output=True, text=True,
+                              timeout=60)
+
+    proc = run("start")
+    assert proc.returncode == 2 and "no marker" in proc.stderr and "refusing to start" in proc.stderr, proc.stderr
+    for cmd in ("status", "stop"):
+        proc = run(cmd)
+        assert proc.returncode == 0 and "cannot determine the isolation mode" in proc.stderr, proc.stderr
     assert not state.exists()
+    names = {"targets.sh": ("proxy", "modern", "legacy"), "agents.sh": ("translator", "fuzzer", "cutover-gate")}[script]
+    # stop looked for every component user's processes (the stand-in pgrep found none, so nothing was killed)
+    lines = calls.read_text().splitlines()
+    assert {line.split()[-1] for line in lines if line.startswith("pgrep")} == {TEST_USER_PREFIX + n for n in names}
+    assert not any(line.startswith("pkill") for line in lines)
+
+
+@pytest.mark.parametrize("script", ["targets.sh", "agents.sh"])
+def test_scripts_stop_and_status_survive_a_broken_interpreter(tmp_path, script):
+    """Scripts 10b: a broken Python must not leave components running: stop still stops, start fails closed."""
+    state = tmp_path / "state"
+    broken = tmp_path / "broken-python"
+    broken.write_text("#!/bin/sh\nexit 127\n")
+    broken.chmod(0o755)
+    stub_env, calls = _no_real_kills(tmp_path)
+    env = {**os.environ, **stub_env, "PYTHON": str(broken), "STRANGLER_STATE_DIR": str(state),
+           "STRANGLER_RUN_DIR": str(state / "run")}
+    for cmd, rc in (("stop", 0), ("status", 0), ("start", 2)):
+        proc = subprocess.run(["bash", str(ROOT / "scripts" / script), cmd], env=env, capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == rc, (cmd, proc.stdout, proc.stderr)
+    assert calls.exists() and all(line.startswith("pgrep") for line in calls.read_text().splitlines())
+
+
+# ------------------------------------------------------------------------------------------ review round 3
+# Host safety: none of these tests runs useradd/userdel, writes /srv/stranglerroom, /etc/stranglerroom or the
+# checkout's .state, or signals anything but processes it started itself.
+
+@pytest.mark.parametrize("url, canonical", [
+    ("http://127.0.0.1", "http://127.0.0.1:80"), ("https://127.0.0.1/", "https://127.0.0.1:443/"),
+    ("HTTP://[::1]:18000", "http://[::1]:18000"), ("http://10.2.3.4:9000/base", "http://10.2.3.4:9000/base")])
+def test_check_ip_url_returns_a_canonical_url(url, canonical):
+    assert iso.check_ip_url("SWITCH_URL", url) == canonical
+    target = httpx.URL(canonical)  # what the components' HTTP client will actually dial
+    port = int(canonical.rsplit(":", 1)[1].split("/")[0])
+    assert target.host in ("127.0.0.1", "::1", "10.2.3.4")
+    assert (target.port or {"http": 80, "https": 443}[target.scheme]) == port  # httpx elides a default port
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost:18000\\@127.0.0.1:18000/",  # codex round 2 #2: urllib reads 127.0.0.1, other clients localhost
+    "http://user:pw@127.0.0.1:18000", "http://@127.0.0.1:1", "ftp://127.0.0.1:21", "file:///etc/passwd",
+    "http://0.0.0.0:18000", "http://[::]:18000", "http://127.0.0.1:99999", "http://127.0.0.1:0",
+    "http://127.0.0.1:x", "http://127.0.0.1:18000/\x00", "http://127.0.0.1:18000/\n", "http://127.0.0.1:1/ a",
+    "http://127.0.0.1:1/?q=1", "http://127.0.0.1:1/#f", "http://localhost:18000", "//127.0.0.1:1"])
+def test_check_ip_url_refuses_ambiguous_or_unsafe_urls(url):
+    with pytest.raises(iso.IsolationError):
+        iso.check_ip_url("SWITCH_URL", url)
+
+
+def test_child_env_forwards_only_the_canonical_url():
+    env = iso.child_env("cutover-gate", {"PROXY_URL": "http://127.0.0.1"}, paths=iso.service_paths("/srv/sr"),
+                        router_token="t", switch_url="http://127.0.0.1:18000/")
+    assert env["PROXY_URL"] == "http://127.0.0.1:80" and env["SWITCH_URL"] == "http://127.0.0.1:18000/"
+
+
+@requires_root
+def test_service_path_is_fixed_and_root_only(world_tmp):
+    good = world_tmp / "good"
+    good.mkdir()
+    foreign = world_tmp / "foreign"
+    foreign.mkdir()
+    os.chown(foreign, NOBODY, NOBODY)
+    writable = world_tmp / "writable"
+    writable.mkdir()
+    writable.chmod(0o777)
+    path = iso.service_path([str(good), str(foreign), str(writable), str(world_tmp / "missing"), "/usr/bin"])
+    assert path == f"{good}:/usr/bin"
+    # root's PATH never reaches a component
+    env = iso.child_env("legacy", {"PATH": f"{writable}:/root/.local/bin"}, paths=iso.service_paths("/srv/sr"))
+    assert env["PATH"] == iso.service_path() and str(writable) not in env["PATH"] and "/root" not in env["PATH"]
+    for directory in env["PATH"].split(":"):
+        iso.check_link_target(directory, Path("/"))  # every kept directory is root's alone
+
+
+@requires_root
+def test_llm_cmd_is_pinned_to_the_checked_absolute_executable(world_tmp):
+    assert iso.pin_llm_cmd("true --flag 'two words'", "/usr/bin") == "/usr/bin/true --flag 'two words'"
+    env = iso.child_env("translator", {"STRANGLER_TRANSLATOR_MODE": "llm", "STRANGLER_LLM_CMD": "true -p"},
+                        paths=iso.service_paths("/srv/sr"), switch_url="http://127.0.0.1:18000")
+    assert shlex.split(env["STRANGLER_LLM_CMD"])[0].startswith("/") and env["STRANGLER_LLM_CMD"].endswith(" -p")
+    # a later name lookup can no longer pick something else: the translator gets the absolute path
+    planted = world_tmp / "true"
+    planted.write_text("#!/bin/sh\n")
+    planted.chmod(0o755)
+    os.chown(world_tmp / "true", NOBODY, NOBODY)
+    with pytest.raises(iso.IsolationError, match="owned by uid"):
+        iso.pin_llm_cmd(str(planted), "/usr/bin")
+    with pytest.raises(iso.IsolationError, match="not an executable on the service PATH"):
+        iso.pin_llm_cmd("no-such-cli-xyz", "/usr/bin")
+    with pytest.raises(iso.IsolationError, match="bare name or an absolute path"):
+        iso.pin_llm_cmd("./true", "/usr/bin")
+    with pytest.raises(iso.IsolationError):  # launch fails, it never starts the translator with an unchecked CLI
+        iso.child_env("translator", {"STRANGLER_TRANSLATOR_MODE": "llm", "STRANGLER_LLM_CMD": "no-such-cli-xyz"},
+                      paths=iso.service_paths("/srv/sr"), switch_url="http://127.0.0.1:18000")
+
+
+@requires_root
+def test_drop_privileges_refuses_suid_dumpable_1_before_changing_ids():
+    def child(policy):
+        iso._suid_dumpable = lambda: policy
+        try:
+            iso.drop_privileges(NOBODY, NOBODY, [])
+            return ["dropped", list(os.getresuid())]
+        except iso.IsolationError as exc:
+            return [str(exc), list(os.getresuid())]
+
+    refused, uids = in_child(child, 1)["result"]
+    assert "suid_dumpable is 1" in refused and uids == [0, 0, 0]  # nothing changed
+    refused, uids = in_child(child, None)["result"]
+    assert "suid_dumpable is None" in refused and uids == [0, 0, 0]
+    for policy in (0, 2):
+        assert in_child(child, policy)["result"] == ["dropped", [NOBODY] * 3]
+
+
+@pytest.mark.parametrize("ret, err, no_keyring, outcome", [
+    (5, 0, False, "joined"),
+    (-1, iso.errno.EKEYREVOKED, False, "joined"),
+    (-1, iso.errno.EPERM, False, "refused"),
+    (-1, iso.errno.EPERM, True, "joined"),       # provably nothing to leave
+    (-1, iso.errno.EACCES, False, "refused"),
+])
+def test_keyring_separation_fails_closed(monkeypatch, ret, err, no_keyring, outcome):
+    monkeypatch.setattr(iso, "_keyctl", lambda *args: (ret, err))
+    monkeypatch.setattr(iso, "_no_inherited_keyring", lambda: no_keyring)
+    if outcome == "refused":
+        with pytest.raises(iso.IsolationError, match="session keyring"):
+            iso._join_session_keyring()
+    else:
+        iso._join_session_keyring()
+
+
+def test_keyring_unknown_architecture_is_not_a_silent_skip(monkeypatch):
+    import platform
+
+    if not os.path.exists("/proc/keys"):
+        pytest.skip("this kernel has no keys facility")
+    monkeypatch.setattr(platform, "machine", lambda: "unknown-arch")
+    assert iso._keyctl(1, None) == (-1, iso.errno.ENOSYS)
+    monkeypatch.setattr(iso, "_no_inherited_keyring", lambda: False)
+    with pytest.raises(iso.IsolationError, match="session keyring"):
+        iso._join_session_keyring()
+
+
+@requires_root
+def test_relative_link_through_a_relative_then_absolute_link_keeps_its_suffix(world_tmp, checkout):
+    """codex round 2 #1: a -> b, b -> /usr, evil.py -> a/../tmp/x resolves to /tmp/x, which a service controls."""
+    venv = checkout / ".venv"
+    (venv / "b").symlink_to("/usr")
+    (venv / "a").symlink_to("b")
+    paths = iso.service_paths(world_tmp / "srv")
+    iso.ensure_service_home(paths)
+    iso.sync_mirrors(checkout, paths)  # a and b alone are fine
+    (venv / "evil.py").symlink_to("a/../tmp/x")
+    with pytest.raises(iso.IsolationError, match="refusing to mirror"):
+        iso.sync_mirrors(checkout, paths)
+    with pytest.raises(iso.IsolationError):
+        iso.check_link_target("a/../tmp/x", venv)  # the general resolver agrees
+
+
+@requires_root
+def test_inventory_validates_tracked_pids_and_flags_unexplained_processes(world_tmp, checkout):
+    paths = iso.service_paths(world_tmp / "srv")
+    iso.ensure_service_home(paths)
+    report = _launch_in_child("proxy", ["python", "-m", "targets.proxy.router", "--sleep", "--child"],
+                              _values(checkout), ids_for("proxy"), paths, checkout)
+    tracked = report["_pid"]
+    ids = ids_for("proxy")
+    stray = subprocess.Popen([BASE_PYTHON, "-I", "-c", "import time; time.sleep(30)"], user=ids.uid, group=ids.gid,
+                             extra_groups=[], cwd="/")
+    try:
+        time.sleep(0.3)
+        rows = iso.process_checks({"proxy": ids}, {}, {"proxy": tracked}, instances={"proxy": [tracked]})
+        unexplained = [r for r in rows if r.check.startswith("unexplained process")]
+        assert [r.status for r in unexplained] == ["FAIL"] and f"pid {stray.pid}" in unexplained[0].check
+        # the tracked pid passes its checks, and its forked child (like a reload worker) is explained
+        own = [r for r in rows if r.check.startswith(f"pid {tracked} ")]
+        assert own and all(r.status == "PASS" for r in own), own
+        # a tracked pid is judged by pid file and uid whatever its argv: here the stray, which runs no module
+        rows = iso.process_checks({"proxy": ids}, {}, {"proxy": stray.pid}, instances={})
+        assert any(r.check.startswith(f"pid {stray.pid} runs as uid") and r.status == "PASS" for r in rows)
+        assert any(r.check.startswith("unexplained process") and f"pid {tracked}" in r.check for r in rows)
+    finally:
+        stray.kill()
+        stray.wait()
+        _kill_uid(ids.uid)  # the tracked fake and its child: synthetic uid, test processes only
+        os.waitpid(tracked, 0)
+
+
+def _kill_uid(uid: int) -> None:
+    """SIGKILL every process of a SYNTHETIC test uid (never a real service user)."""
+    assert uid in UIDS.values()
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            try:
+                uid_line = next(ln for ln in (entry / "status").read_text().splitlines() if ln.startswith("Uid:"))
+                if int(uid_line.split()[2]) == uid:
+                    os.kill(int(entry.name), signal.SIGKILL)
+            except (OSError, StopIteration, ValueError):
+                continue
+
+
+def test_tracked_pid_reads_the_pid_file_regardless_of_argv(tmp_path):
+    env = {"STRANGLER_STATE_DIR": str(tmp_path)}
+    (tmp_path / "run").mkdir()
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        (tmp_path / "run" / "legacy.pid").write_text(f"{other.pid}\n")
+        assert iso.tracked_pid("legacy", env) == other.pid and iso.live_pid("legacy", env) is None
+        (tmp_path / "run" / "legacy.pid").write_text("999999\n")
+        assert iso.tracked_pid("legacy", env) is None
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_expected_listeners_follow_the_effective_endpoints(monkeypatch):
+    monkeypatch.setattr(iso, "_lookup", lambda fn, name: type("Pw", (), {"pw_uid": 5000 + len(name)})())
+    expected = iso._expected_listeners({"SWITCH_URL": "http://127.0.0.1:18000", "PROXY_URL": "http://127.0.0.1:19000",
+                                        "LEGACY_URL": "http://10.9.9.9:9001", "MODERN_URL": "http://[::1]"})
+    assert expected[18000] == ("switch", 0)
+    assert expected[19000][0] == "proxy" and expected[9000][0] == "proxy"  # dialled and bound ports
+    assert expected[80][0] == "modern"            # scheme default port
+    assert 9001 in expected and expected[9001][0] == "legacy"  # bound by targets.sh; the remote URL is not checked
+    with pytest.raises(iso.IsolationError, match="both switch and proxy"):
+        iso._expected_listeners({"SWITCH_URL": "http://127.0.0.1:9000"})
+    with pytest.raises(iso.IsolationError, match="IP literal"):
+        iso._expected_listeners({"SWITCH_URL": "http://127.0.0.1:18000", "PROXY_URL": "http://localhost:9000"})
+
+
+@requires_root
+def test_secret_scan_fails_on_incomplete_coverage(world_tmp, monkeypatch):
+    scan = world_tmp / "scan"
+    deep = scan
+    for _ in range(4):
+        deep = deep / "d"
+    deep.mkdir(parents=True)
+    (deep / "leak.txt").write_text("needle-0123456789")
+    problems: list[str] = []
+    candidates = iso.scan_candidates([scan], problems=problems, max_depth=2)
+    assert problems and "deeper than 2 levels" in problems[0]
+    assert not any(d.endswith("/d/d/d") for d, _ in candidates)
+    monkeypatch.setattr(iso, "SCAN_MAX_DEPTH", 2)
+    rows = iso.secret_scan({"x": iso.Ids(NOBODY, NOBODY)}, {"n": "needle-0123456789"}, [scan])
+    assert any(r.status == "FAIL" and r.check.startswith("incomplete listing") for r in rows)
+    summary = [r for r in rows if "readable files searched" in r.check]
+    assert summary[0].status == "FAIL" and "incomplete" in summary[0].actual  # never PASS on incomplete coverage
+    monkeypatch.setattr(iso, "SCAN_MAX_DEPTH", 1024)
+    monkeypatch.setattr(iso, "SCAN_MAX_TOTAL_BYTES", 4)  # an overall cap reached
+    rows = iso.secret_scan({"x": iso.Ids(NOBODY, NOBODY)}, {"n": "needle-0123456789"}, [scan])
+    assert any(r.status == "FAIL" and "total read cap" in r.check for r in rows)
+    assert [r.status for r in rows if "readable files searched" in r.check] == ["FAIL"]
+
+
+@requires_root
+def test_large_files_are_streamed_with_overlap_not_skipped(world_tmp):
+    big = world_tmp / "big.log"
+    secret = b"needle-0123456789"
+    with open(big, "wb") as fh:  # 9 MiB, the secret straddling the 1 MiB chunk boundary
+        fh.write(b"x" * (1024 * 1024 - 5))
+        fh.write(secret)
+        fh.write(b"y" * (8 * 1024 * 1024))
+    big.chmod(0o644)
+    result = iso.run_as(iso.Ids(NOBODY, NOBODY), iso.search_readable, [(str(world_tmp), ["big.log"])],
+                        {"n": secret})
+    assert result["hits"] == [[str(big), ["n"], False]] and result["truncated"] == []
+
+
+@requires_root
+def test_remove_tree_is_iterative_safe_and_keeps_going(world_tmp, monkeypatch):
+    victim = world_tmp / "victim"
+    victim.mkdir()
+    fd = os.open(victim, os.O_RDONLY | os.O_DIRECTORY)
+    for _ in range(1200):  # deeper than Python's recursion limit (built by descriptor: os.makedirs recurses too)
+        os.mkdir("d", dir_fd=fd)
+        child = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+        os.close(fd)
+        fd = child
+    os.close(fd)
+    outside = world_tmp / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("x")
+    (victim / "link").symlink_to(outside)
+    (victim / "a.txt").write_text("a")
+    (victim / "b.txt").write_text("b")
+    real_unlink = os.unlink
+
+    def flaky_unlink(name, *args, **kwargs):
+        if name == "a.txt":
+            raise PermissionError(1, "Operation not permitted")
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(iso.os, "unlink", flaky_unlink)
+    dfd = os.open(world_tmp, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        errors: list[str] = []
+        iso.remove_tree_at(dfd, "victim", victim, errors)
+    finally:
+        os.close(dfd)
+    assert any("a.txt" in e for e in errors)  # reported, and the rest went on
+    assert sorted(os.listdir(victim)) == ["a.txt"] and (outside / "keep").read_text() == "x"
+
+
+@requires_root
+def test_clean_removes_the_keys_first_reports_failures_and_exits_non_zero(world_tmp, checkout, area, monkeypatch,
+                                                                           tmp_path):
+    paths = area
+    order: list[str] = []
+    real = iso.remove_tree_at
+
+    def recording(dir_fd, name, label, errors):
+        order.append(Path(label).name)
+        if Path(label).name == "fuzzer" or Path(label).name.startswith(".trash-"):  # (a retry hits its leftover)
+            errors.append(f"{label}: simulated failure")
+            return None
+        return real(dir_fd, name, label, errors)
+
+    monkeypatch.setattr(iso, "remove_tree_at", recording)
+    lines = iso.clean(paths)
+    assert order[0] == "agents" and "fuzzer" in order and len(order) > 3
+    assert any(line.startswith("ERROR:") and "fuzzer" in line for line in lines)
+    assert not paths.agents.exists() and not paths.private("proxy").exists()  # the others were still removed
+    marker = write_marker(tmp_path, service_home=str(paths.home))
+    monkeypatch.setenv("STRANGLER_ISOLATION_MARKER", marker["STRANGLER_ISOLATION_MARKER"])
+    monkeypatch.setattr(iso, "running_components", lambda uids=(): {})
+    assert iso.clean_target() == paths
+    assert iso.main(["clean"]) == 1  # the simulated failure again (the renamed fuzzer dir): non-zero, no traceback
+
+
+@requires_root
+def test_reset_warns_on_any_os_error_and_goes_on(world_tmp, checkout, area, monkeypatch):
+    paths = area
+    (paths.private("proxy") / "router.json").write_text("{}")
+    paths.module_file.write_text("x = 1\n")
+    real = iso._unlink_at
+
+    def failing(dir_fd, name, label, actions):
+        if name == "router.json":
+            raise PermissionError(1, "Operation not permitted")
+        return real(dir_fd, name, label, actions)
+
+    monkeypatch.setattr(iso, "_unlink_at", failing)
+    owners = {"proxy": UIDS["proxy"], "fuzzer": UIDS["fuzzer"], "module": UIDS["translator"]}
+    actions = iso.reset(paths, owners=owners)
+    assert any(a.startswith("WARNING:") and "Operation not permitted" in a for a in actions)
+    assert not paths.module_file.exists()
+
+
+def test_make_passes_the_interpreter_to_the_scripts():
+    for target in ("targets", "agents", "agents-stop", "stop", "clean-state", "demo"):
+        out = subprocess.run(["make", "-n", target], cwd=ROOT, capture_output=True, text=True, timeout=60).stdout
+        for line in out.splitlines():
+            if "scripts/agents.sh" in line or "scripts/targets.sh" in line:
+                assert line.startswith("PYTHON="), (target, line)
+
+
+def test_fresh_reset_resolves_overrides_like_the_processes(tmp_path):
+    root, home = tmp_path / "root", tmp_path / "home"
+    for d in (root / "rel", root / "state" / "fuzzer", home):
+        d.mkdir(parents=True)
+    files = {"module": root / "rel" / "lists.py", "router": home / "router.json",
+             "registry": root / "state" / "fuzzer" / "divergence_registry.json",
+             "staging": root / "state" / "fuzzer" / "divergence_registry.json.staging",
+             "decoy": tmp_path / "rel" / "lists.py"}  # relative to the caller's cwd, not to $ROOT: kept
+    files["decoy"].parent.mkdir()
+    for path in files.values():
+        path.write_text("x")
+    harness = "\n".join([
+        "set -euo pipefail", f"ROOT={shlex.quote(str(root))}", f"HOME={shlex.quote(str(home))}", "ISOLATE=",
+        "export MODERN_LISTS_PATH=rel/lists.py ROUTER_STATE_FILE='~/router.json' STRANGLER_STATE_DIR=state",
+        _function(ROOT / "scripts/targets.sh", "resolve_path", "fresh_reset"),
+        'STATE="$(resolve_path "${STRANGLER_STATE_DIR:-$ROOT/.state}" home)"', "fresh_reset"])
+    proc = subprocess.run(["bash", "-c", harness], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert [n for n, p in files.items() if p.exists()] == ["decoy"]
+
+
+def test_status_reports_isolation_like_start(tmp_path, fake_module):
+    """opencode scripts #1: with isolation on, status applies start's acceptance."""
+    for rc, expected in ((0, "running (isolated)"), (1, "NOT isolated")):
+        harness = "\n".join([
+            "set -euo pipefail", f"RUN={shlex.quote(str(tmp_path))}", "PREFIX=tests.fake_agent_", "ISOLATE=1",
+            # stand-ins: this pytest process plays the tracked agent; isolated_pid decides
+            "is_agent_pid() { return 0; }", f"isolated_pid() {{ return {rc}; }}",
+            _function(ROOT / "scripts/agents.sh", "module_for", "pid_file", "read_pid", "agent_pid", "status_one"),
+            f"echo {os.getpid()} >\"$RUN/translator.pid\"", "status_one translator"])
+        out = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30).stdout
+        assert expected in out, out
+    port = free_port()
+    assert _svc(fake_module, port, 0).returncode == 0
+    for pid_rc, expected in ((0, "running (isolated)"), (1, "NOT isolated")):
+        harness = "\n".join([
+            "set -euo pipefail", f"RUN={shlex.quote(str(fake_module / 'run'))}", "ISOLATE=1",
+            f"isolated_pid() {{ return {pid_rc}; }}", "isolated_listener() { return 0; }",
+            _function(ROOT / "scripts/targets.sh", "is_target_pid", "target_status"),
+            f"target_status legacy fake_iso_target {port} /health"])
+        out = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30).stdout
+        assert out.startswith(f"{port}") and "ok" in out and expected in out, out
+    harness = "\n".join(["set -euo pipefail", f"RUN={shlex.quote(str(tmp_path))}", "ISOLATE=",
+                         _function(ROOT / "scripts/targets.sh", "is_target_pid", "target_status"),
+                         f"target_status legacy fake_iso_target {port} /health",
+                         f"target_status legacy fake_iso_target {free_port()} /health"])
+    out = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30).stdout
+    assert out.splitlines()[0] == f"{port:<6} ok" and out.splitlines()[1].endswith(" down")  # off: unchanged
+
+
+@requires_root
+def test_smoke_row_fails_without_a_service_interpreter(world_tmp):
+    paths = iso.service_paths(world_tmp / "srv-without-venv")
+    row = iso.smoke_row("legacy", ids_for("legacy"), paths)
+    assert row.status == "FAIL" and "no service interpreter" in row.actual
+
+
+def test_secret_values_keeps_every_datasource_password(world_tmp, checkout):
+    native = checkout / ".native"
+    (native / "mattermost" / "config").mkdir(parents=True)
+    (native / "mm-env.sh").write_text("export MM_SQLSETTINGS_DATASOURCE='postgres://u:first-pass-111@h:5432/m'\n")
+    (native / "mattermost" / "config" / "config.json").write_text(
+        json.dumps({"SqlSettings": {"DataSource": "postgres://u:second-pass-222@h:5432/m"}}))
+    values = iso.secret_values(checkout / ".state", checkout,
+                               env={"MM_SQLSETTINGS_DATASOURCE": "postgres://u:third-pass-333@h/m"})
+    assert values["mattermost-db-password:mm-env.sh"] == "first-pass-111"
+    assert values["mattermost-db-password:config.json"] == "second-pass-222"
+    assert values["mattermost-db-password:env"] == "third-pass-333"
+
+
+@requires_root
+def test_mode_switches_name_the_state_that_does_not_carry_over(tmp_path, world_tmp, checkout, area, monkeypatch):
+    paths = area
+    state = checkout / ".state"
+    (state / "proxy").mkdir()
+    (state / "proxy" / "router.json").write_text("{}")
+    (state / "fuzzer").mkdir()
+    (state / "fuzzer" / "divergence_registry.json").write_text("{}")
+    notes = iso.layout_notes(iso._checkout_state_items({"STRANGLER_STATE_DIR": str(state)}), "the checkout",
+                             "the service area")
+    assert str(state / "proxy" / "router.json") in notes[0] and str(state / "fuzzer") in notes[0]
+    assert "targets.sh start --fresh" in notes[1]
+    (paths.private("proxy") / "router.json").write_text("{}")
+    paths.module_file.write_text("x = 1\n")
+    marker = write_marker(tmp_path, service_home=str(paths.home))
+    actions = iso.disable(marker, running=lambda: {})
+    note = [a for a in actions if a.startswith("NOTE:")]
+    assert note and str(paths.module_file) in note[0] and "make demo" in note[1]
+    assert iso.layout_notes([], "a", "b") == []
+
+
+@pytest.mark.parametrize("script", ["scripts/targets.sh", "scripts/agents.sh"])
+def test_stop_waits_until_the_service_users_processes_have_exited(tmp_path, script):
+    """agy re-audit 1.2: stop returns only once pgrep finds no process of the user any more (the signals here take
+    effect late: pgrep keeps seeing the processes for four rounds), so a following `isolation clean` never sees
+    them running. Stand-ins only: no real user is involved."""
+    polls, kills = tmp_path / "polls", tmp_path / "kills"
+    harness = "\n".join([
+        "set -euo pipefail", "id() { return 0; }", "sleep() { :; }",
+        f"pkill() {{ echo x >>{kills}; }}",
+        f"pgrep() {{ echo x >>{polls}; [ \"$(wc -l <{polls})\" -le 4 ] && echo 4242;",
+        f"  [ \"$(wc -l <{polls})\" -le 4 ]; }}",
+        _function(ROOT / script, "kill_service_user"), "kill_service_user srtest-legacy", "echo returned"])
+    proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and proc.stdout.strip() == "returned", proc.stderr
+    assert len(polls.read_text().splitlines()) == 5 and len(kills.read_text().splitlines()) == 4
+    assert "survive" not in proc.stderr
+
+
+@requires_root
+def test_clean_as_non_root_leaves_the_service_area_alone(tmp_path, world_tmp, checkout, area, monkeypatch, capsys):
+    """agy re-audit 1.1: `make clean-state` as a normal user must neither crash nor touch the service area."""
+    paths = area
+    marker = write_marker(tmp_path, service_home=str(paths.home))
+    monkeypatch.setenv("STRANGLER_ISOLATION_MARKER", marker["STRANGLER_ISOLATION_MARKER"])
+    monkeypatch.setattr(iso.os, "geteuid", lambda: 1000)
+    before = sorted(str(p) for p in paths.state.rglob("*"))
+    assert iso.main(["clean"]) == 0
+    out = capsys.readouterr().out
+    assert "not root: leaving the service area alone (run make clean-state as root to empty it)" in out
+    assert sorted(str(p) for p in paths.state.rglob("*")) == before

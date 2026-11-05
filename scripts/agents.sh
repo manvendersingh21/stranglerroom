@@ -22,6 +22,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"
+case "$STATE" in  # as the Python side reads it: ~ expanded, relative to the checkout
+  "~") STATE="$HOME" ;;
+  "~/"*) STATE="$HOME/${STATE#"~/"}" ;;
+esac
 case "$STATE" in
   /*) ;;
   *) STATE="$ROOT/$STATE" ;;
@@ -36,12 +40,21 @@ case "$RUN" in
 esac
 
 ISOLATE=""
-mode="$(cd "$ROOT" && PYTHONPATH="$ROOT" "$PYTHON" -m agents.isolation mode --run-dir "$RUN")" \
-  || { echo "error: cannot determine the isolation mode (see above); refusing to start or stop anything" >&2; exit 2; }
+MODE_UNKNOWN=""
+if ! mode="$(cd "$ROOT" && PYTHONPATH="$ROOT" "$PYTHON" -m agents.isolation mode --run-dir "$RUN")"; then
+  mode=unknown
+fi
 case "$mode" in
   on) ISOLATE=1 ;;
   off) ;;
-  *) echo "error: unexpected isolation mode '$mode'" >&2; exit 2 ;;
+  *)
+    case "${1:-}" in
+      stop|status)  # never leave agents running because the mode is unknown (e.g. a broken interpreter)
+        MODE_UNKNOWN=1
+        echo "warning: cannot determine the isolation mode; ${1} acts on the tracked pids and on every sr-* agent" \
+             "user's processes" >&2 ;;
+      *) echo "error: cannot determine the isolation mode (see above); refusing to start" >&2; exit 2 ;;
+    esac ;;
 esac
 # Isolated: pid files and logs are root's alone (an agent could otherwise reopen its log via /proc/self/fd/1).
 if [ -n "$ISOLATE" ]; then umask 077; fi
@@ -94,13 +107,28 @@ is_agent_pid() {
 # is_agent_pid() too.
 isolated_pid() { # pid name
   local pid="$1" want uids args=() i
-  want="$(id -u "sr-$2" 2>/dev/null)" || return 1
+  want="$(id -u "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$2" 2>/dev/null)" || return 1
   uids="$(awk '/^Uid:/ {print $2, $3, $4, $5}' "/proc/$pid/status" 2>/dev/null)" || return 1
   [ "$uids" = "$want $want $want $want" ] || return 1
   mapfile -d '' -t args 2>/dev/null <"/proc/$pid/cmdline" || return 1
   for ((i = 0; i + 1 < ${#args[@]}; i++)); do
     if [ "${args[i]}" = "-m" ] && [ "${args[i+1]}" = "agents.isolation" ]; then return 1; fi
   done
+}
+
+# Kill every process of service user <user> (e.g. a daemon a compromised agent
+# forked), repeating until none is left (at most 50 rounds); report survivors.
+# The service users are ${STRANGLER_SERVICE_USER_PREFIX:-sr-}<name>; the variable is a test seam (tests set a prefix
+# that names no real user, so not even an unstubbed pkill can reach a live deployment).
+kill_service_user() { # user
+  local _
+  id -u "$1" >/dev/null 2>&1 || return 0
+  for _ in $(seq 1 50); do
+    pgrep -u "$1" >/dev/null 2>&1 || return 0
+    pkill -KILL -u "$1" 2>/dev/null || true
+    sleep 0.1
+  done
+  echo "warning: processes of $1 survive repeated KILL: $(pgrep -u "$1" | tr '\n' ' ')" >&2
 }
 
 # Echo the live PID for <name> if (and only if) it belongs to our agent module.
@@ -194,24 +222,33 @@ stop_all() {
   for name in "${AGENT_NAMES[@]}"; do
     pid="$(agent_pid "$name")"
     [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
-    # Isolated: whatever else runs as sr-<name> (e.g. a daemon a compromised agent forked) goes too.
-    if [ -n "${ISOLATE:-}" ]; then pkill -KILL -u "sr-$name" 2>/dev/null || true; fi
+    # Isolated (or mode unknown): whatever else runs as sr-<name> goes too.
+    if [ -n "${ISOLATE:-}${MODE_UNKNOWN:-}" ]; then kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name"; fi
     rm -f "$(pid_file "$name")"
   done
 }
 
+# Isolated, an agent counts as running isolated only by the checks start applies.
 status_one() {
   local name="$1" pid
   pid="$(agent_pid "$name")"
-  if [ -n "$pid" ]; then
-    echo "$name running pid=$pid"
-  else
+  if [ -z "$pid" ]; then
     echo "$name stopped"
+  elif [ -z "${ISOLATE:-}" ]; then
+    echo "$name running pid=$pid"
+  elif isolated_pid "$pid" "$name"; then
+    echo "$name running (isolated) pid=$pid"
+  else
+    echo "$name running, NOT isolated — run 'scripts/agents.sh restart' pid=$pid"
   fi
 }
 
 # Serialise start/stop/restart so concurrent invocations cannot spawn untracked duplicates.
 lock() {
+  if [ -n "$MODE_UNKNOWN" ]; then  # the run dir was not validated: never create or open anything in it
+    echo "warning: not taking $RUN/.lock (isolation mode unknown)" >&2
+    return 0
+  fi
   mkdir -p "$RUN"
   exec 9>"$RUN/.lock"
   flock 9

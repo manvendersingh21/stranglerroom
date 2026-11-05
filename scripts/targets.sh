@@ -21,21 +21,39 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PYTHON:-$ROOT/.venv/bin/python}"
-STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"
-case "$STATE" in /*) ;; *) STATE="$ROOT/$STATE" ;; esac
+
+# A path override the way the Python processes read it: relative ones against $ROOT (their working directory), and
+# with "home", a leading ~ expanded (they expanduser STRANGLER_STATE_DIR and ROUTER_STATE_FILE, not MODERN_LISTS_PATH).
+resolve_path() { # path [home]
+  local p="$1"
+  if [ "${2:-}" = home ]; then
+    case "$p" in "~") p="$HOME" ;; "~/"*) p="$HOME/${p#"~/"}" ;; esac
+  fi
+  case "$p" in /*) ;; *) p="$ROOT/$p" ;; esac
+  printf '%s\n' "$p"
+}
+
+STATE="$(resolve_path "${STRANGLER_STATE_DIR:-$ROOT/.state}" home)"
 RUN="$STATE/run"
 export PYTHONPATH="$ROOT"
 ISOLATE=""
-mode="$(cd "$ROOT" && "$PY" -m agents.isolation mode --run-dir "$RUN")" \
-  || { echo "error: cannot determine the isolation mode (see above); refusing to start or stop anything" >&2; exit 2; }
+MODE_UNKNOWN=""
+if ! mode="$(cd "$ROOT" && "$PY" -m agents.isolation mode --run-dir "$RUN")"; then mode=unknown; fi
 case "$mode" in
   on) ISOLATE=1 ;;
   off) ;;
-  *) echo "error: unexpected isolation mode '$mode'" >&2; exit 2 ;;
+  *)
+    case "${1:-start}" in
+      stop|status)  # never leave components running because the mode is unknown (e.g. a broken interpreter)
+        MODE_UNKNOWN=1
+        echo "warning: cannot determine the isolation mode; ${1} acts on the tracked pids and on every sr-* user's" \
+             "processes" >&2 ;;
+      *) echo "error: cannot determine the isolation mode (see above); refusing to start" >&2; exit 2 ;;
+    esac ;;
 esac
 # Isolated: pid files and logs are root's alone (a service could otherwise reopen its log via /proc/self/fd/1).
 if [ -n "$ISOLATE" ]; then umask 077; fi
-mkdir -p "$RUN"
+if [ -z "$MODE_UNKNOWN" ]; then mkdir -p "$RUN"; fi
 
 # True only if <pid> is alive AND its argv holds the exact pairs `-m <module>` and `--port <port>` (a reused pid
 # that happens to run the same module for another port — e.g. a test's modern target — is not ours either).
@@ -56,7 +74,7 @@ is_target_pid() { # pid module port
 # is_target_pid() too.
 isolated_pid() { # pid name
   local pid="$1" want uids args=() i
-  want="$(id -u "sr-$2" 2>/dev/null)" || return 1
+  want="$(id -u "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$2" 2>/dev/null)" || return 1
   uids="$(awk '/^Uid:/ {print $2, $3, $4, $5}' "/proc/$pid/status" 2>/dev/null)" || return 1
   [ "$uids" = "$want $want $want $want" ] || return 1
   mapfile -d '' -t args 2>/dev/null <"/proc/$pid/cmdline" || return 1
@@ -69,11 +87,26 @@ isolated_pid() { # pid name
 # component (/proc/net/tcp{,6}; root here may lack CAP_SYS_PTRACE to map another uid's sockets to its pid).
 isolated_listener() { # port name
   local want hex uids
-  want="$(id -u "sr-$2" 2>/dev/null)" || return 1
+  want="$(id -u "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$2" 2>/dev/null)" || return 1
   hex="$(printf ':%04X' "$1")"
   uids="$(awk -v p="$hex" '$4 == "0A" && substr($2, length($2) - 4) == p {print $8}' /proc/net/tcp /proc/net/tcp6 \
           2>/dev/null | sort -u)"
   [ "$uids" = "$want" ]
+}
+
+# Kill every process of service user <user> (e.g. a daemon a compromised component forked), repeating until none is
+# left (at most 50 rounds); report any survivor.
+# The service users are ${STRANGLER_SERVICE_USER_PREFIX:-sr-}<name>; the variable is a test seam (tests set a prefix
+# that names no real user, so not even an unstubbed pkill can reach a live deployment).
+kill_service_user() { # user
+  local _
+  id -u "$1" >/dev/null 2>&1 || return 0
+  for _ in $(seq 1 50); do
+    pgrep -u "$1" >/dev/null 2>&1 || return 0
+    pkill -KILL -u "$1" 2>/dev/null || true
+    sleep 0.1
+  done
+  echo "warning: processes of $1 survive repeated KILL: $(pgrep -u "$1" | tr '\n' ' ')" >&2
 }
 
 # True if something accepts TCP connections on 127.0.0.1:<port>.
@@ -150,9 +183,34 @@ stop_one() { # name module port
   elif [ -n "$pid" ]; then
     echo "  $name: stale pid file ($pid is not a running $module --port $port) — not signalling it" >&2
   fi
-  # Isolated: whatever else runs as sr-<name> (e.g. a daemon a compromised server forked) goes too.
-  if [ -n "${ISOLATE:-}" ]; then pkill -KILL -u "sr-$name" 2>/dev/null || true; fi
+  # Isolated (or mode unknown): whatever else runs as sr-<name> goes too.
+  if [ -n "${ISOLATE:-}${MODE_UNKNOWN:-}" ]; then kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name"; fi
   rm -f "$RUN/$name.pid"
+}
+
+# --fresh: remove what the processes actually use (overrides resolved the way they resolve them), and, isolated, the
+# same files in the service area.
+fresh_reset() {
+  rm -f "$(resolve_path "${MODERN_LISTS_PATH:-$ROOT/targets/modern_fastapi/app/lists.py}")" \
+        "$(resolve_path "${ROUTER_STATE_FILE:-$STATE/proxy/router.json}" home)" \
+        "$STATE/fuzzer/divergence_registry.json" "$STATE/fuzzer/divergence_registry.json.staging"
+  if [ -n "${ISOLATE:-}" ]; then (cd "$ROOT" && "$PY" -m agents.isolation reset); fi
+}
+
+# One status line per target. Isolated, an answering target is reported as isolated only if it passes the checks
+# start applies (tracked pid, sr-<name>, owner of the listener).
+target_status() { # name module port path
+  local name="$1" module="$2" port="$3" path="$4" pid body
+  printf '%-6s ' "$port"
+  if ! body="$(curl -fsS -m 5 "http://127.0.0.1:$port$path" 2>/dev/null)"; then echo down; return 0; fi
+  if [ -z "${ISOLATE:-}" ]; then printf '%s\n' "$body"; return 0; fi
+  pid="$(cat "$RUN/$name.pid" 2>/dev/null || true)"
+  if is_target_pid "$pid" "$module" "$port" && isolated_pid "$pid" "$name" && isolated_listener "$port" "$name"; then
+    printf '%s  [%s running (isolated), pid %s]\n' "$body" "$name" "$pid"
+  else
+    printf '%s  [%s running, NOT isolated — run restart: scripts/targets.sh stop; scripts/targets.sh start]\n' \
+      "$body" "$name"
+  fi
 }
 
 stop() {
@@ -175,6 +233,10 @@ ports_free() { # port...
 }
 
 lock() {
+  if [ -n "$MODE_UNKNOWN" ]; then  # the run dir was not validated: never create or open anything in it
+    echo "warning: not taking $RUN/.targets.lock (isolation mode unknown)" >&2
+    return 0
+  fi
   exec 9>"$RUN/.targets.lock"
   flock -w 60 9 || { echo "error: $RUN/.targets.lock is held by another targets.sh start/stop for 60 s — giving up" >&2; exit 1; }
 }
@@ -185,20 +247,17 @@ case "${1:-start}" in
     if [ "${2:-}" = "--fresh" ]; then
       stop
       ports_free 9000 9001 9002
-      # Reset what the processes actually use: the same defaults and overrides as the Python side.
-      rm -f "${MODERN_LISTS_PATH:-$ROOT/targets/modern_fastapi/app/lists.py}" "${ROUTER_STATE_FILE:-$STATE/proxy/router.json}" \
-            "$STATE/fuzzer/divergence_registry.json" "$STATE/fuzzer/divergence_registry.json.staging"
-      if [ -n "$ISOLATE" ]; then (cd "$ROOT" && "$PY" -m agents.isolation reset); fi
+      fresh_reset
     fi
     echo "starting targets"
     svc legacy targets.legacy_openlibrary.server 9001 /health
     svc modern targets.modern_fastapi.server 9002 /health
     svc proxy targets.proxy.router 9000 /_router/status
     ;;
-  stop) lock; stop; echo "targets stopped" ;;
+  stop) lock; stop; echo "targets stopped" ;;  # mode unknown: stop_one also kills every sr-<target> process
   status)
-    for p in 9001:/health 9002:/_meta 9000:/_router/status; do
-      printf '%-6s ' "${p%%:*}"; curl -fsS -m 5 "http://127.0.0.1:${p%%:*}${p#*:}" 2>/dev/null || printf 'down'; echo
-    done ;;
+    target_status legacy targets.legacy_openlibrary.server 9001 /health
+    target_status modern targets.modern_fastapi.server 9002 /_meta
+    target_status proxy targets.proxy.router 9000 /_router/status ;;
   *) echo "usage: $0 start [--fresh] | stop | status" >&2; exit 2 ;;
 esac

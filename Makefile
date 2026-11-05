@@ -31,7 +31,7 @@ agents: ## Start the three agents.
 	PYTHON=$(PY) bash scripts/agents.sh start
 
 agents-stop: ## Stop the three agents.
-	bash scripts/agents.sh stop
+	PYTHON=$(PY) bash scripts/agents.sh stop
 
 test: ## Run the fast test suite (non-integration).
 	$(PY) -m pytest -m 'not integration'
@@ -54,12 +54,12 @@ cinema: ## Run the demo with cinematic pacing from a fresh state.
 
 stop: ## Stop agents, targets and Switch.
 	+$(MAKE) agents-stop
-	bash scripts/targets.sh stop
+	PYTHON=$(PY) bash scripts/targets.sh stop
 	+$(MAKE) switch-down
 
 clean-state: ## Stop agents+targets, then remove runtime state (keeps switch.env and connection.env).
-	bash scripts/agents.sh stop
-	bash scripts/targets.sh stop
+	PYTHON=$(PY) bash scripts/agents.sh stop
+	PYTHON=$(PY) bash scripts/targets.sh stop
 	PYTHONPATH=. $(PY) -m agents.isolation clean
 	mkdir -p "$${STRANGLER_STATE_DIR:-.state}"
 	find "$${STRANGLER_STATE_DIR:-.state}" -mindepth 1 -maxdepth 1 ! -name switch.env ! -name connection.env -exec rm -rf {} +

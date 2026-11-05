@@ -28,7 +28,6 @@ import os
 import pwd
 import re
 import select
-import shutil
 import signal
 import stat
 import subprocess
@@ -53,7 +52,6 @@ APP_EXCLUDE_DIRS = frozenset({"__pycache__", ".pytest_cache", ".hypothesis"})
 APP_EXCLUDE_FILES = frozenset({"targets/modern_fastapi/app/lists.py"})
 SCAN_ROOTS = ("/srv", "/tmp", "/var/tmp", "/dev/shm", "/etc", "/home", "/opt", "/var/log",
               "/var/lib/stranglerroom", "/root")
-SCAN_MAX_BYTES = 8 * 1024 * 1024
 #: shorter values would match all over the file system; they are reported as "not scanned", not searched
 MIN_SECRET_LEN = 8
 
@@ -429,10 +427,12 @@ def _ready_paths(values: Mapping[str, str]) -> ServicePaths:
 
 _LOCALE_KEYS = ("LC_ALL", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY", "LC_MESSAGES",
                 "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION")
-_COMMON_KEYS = frozenset({"PATH", "LANG", "LANGUAGE", "TZ", "PYTHONUNBUFFERED", "STRANGLER_LOG_LEVEL",
-                          *_LOCALE_KEYS})
-_LAUNCHER_SET = frozenset({"STRANGLER_STATE_DIR", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTHONSAFEPATH", "HOME",
-                           "USER", "LOGNAME", "MODERN_LISTS_PATH", "ROUTER_ADMIN_TOKEN", "SWITCH_URL"})
+_COMMON_KEYS = frozenset({"LANG", "LANGUAGE", "TZ", "PYTHONUNBUFFERED", "STRANGLER_LOG_LEVEL", *_LOCALE_KEYS})
+_LAUNCHER_SET = frozenset({"PATH", "STRANGLER_STATE_DIR", "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTHONSAFEPATH",
+                           "HOME", "USER", "LOGNAME", "MODERN_LISTS_PATH", "ROUTER_ADMIN_TOKEN", "SWITCH_URL"})
+#: every component's PATH, whatever root's is: only directories that root alone can change (checked at each launch,
+#: missing or untrusted ones dropped), so nothing a service writes is ever found by name
+SERVICE_PATH_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
 #: URLs a component dials: a host name such as localhost may resolve to ::1 first, where any service user can listen
 #: if the real server binds 127.0.0.1 only (and collect bearer keys). Only IP literals are accepted.
 _URL_KEYS = ("SWITCH_URL", "PROXY_URL", "LEGACY_URL", "MODERN_URL")
@@ -472,6 +472,9 @@ def child_env(component: Component | str, parent_env: Mapping[str, str], *, path
         for name in _pass_names(parent_env):
             if name in parent_env:
                 env[name] = parent_env[name]
+    env["PATH"] = service_path()
+    if comp.name == "translator" and (env.get("STRANGLER_TRANSLATOR_MODE") or "").strip().lower() == "llm":
+        env["STRANGLER_LLM_CMD"] = pin_llm_cmd(env.get("STRANGLER_LLM_CMD"), env["PATH"])
     env["STRANGLER_STATE_DIR"] = str(paths.state)
     env["PYTHONPATH"] = str(paths.app)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -495,23 +498,109 @@ def child_env(component: Component | str, parent_env: Mapping[str, str], *, path
     env.pop("ROUTER_TOKEN_FILE", None)
     for key in _URL_KEYS:
         if key in env:
-            check_ip_url(key, env[key])
+            env[key] = check_ip_url(key, env[key])  # the canonical form, never the original string
     return env
 
 
-def check_ip_url(key: str, url: str) -> None:
-    """``url`` must name its host as an IP literal (loopback or remote), never a name such as ``localhost``: a name
-    can resolve to an address (e.g. ::1) where the real server does not listen but any service user may."""
+def service_path(dirs: Sequence[str] = SERVICE_PATH_DIRS) -> str:
+    """The fixed PATH of every component: each directory kept only if it exists and its whole resolution chain is
+    root's alone (``check_link_target``; /bin may be a root-owned link to usr/bin)."""
+    kept = []
+    for directory in dirs:
+        try:
+            resolved = check_link_target(directory, Path("/"))
+        except (IsolationError, OSError):
+            continue
+        if os.path.isdir(resolved):
+            kept.append(directory)
+    return ":".join(kept)
+
+
+LLM_CLI_FIX = ("install the LLM CLI outside /root (root-owned, e.g. /usr/local/bin) and pass its key with "
+               "STRANGLER_TRANSLATOR_PASS_ENV")
+
+
+def pin_llm_cmd(cmd: str | None, search: str) -> str:
+    """In LLM mode: resolve the first word of ``STRANGLER_LLM_CMD`` (default: agents.llm_synth.DEFAULT_LLM_CMD) on
+    the component PATH ``search``, require an executable whose whole resolution chain only root can change, and
+    return the command with that absolute path as its first word (shlex round trip), so the translator executes
+    exactly what was checked, never whatever a name resolves to later."""
+    import shlex
+
+    if not (cmd or "").strip():
+        from agents.llm_synth import DEFAULT_LLM_CMD
+
+        cmd = DEFAULT_LLM_CMD
+    try:
+        words = shlex.split(cmd)
+    except ValueError as exc:
+        raise IsolationError(f"STRANGLER_LLM_CMD is not a valid command line ({exc})") from None
+    if not words:
+        raise IsolationError(f"STRANGLER_LLM_CMD is empty: {LLM_CLI_FIX}")
+    word = words[0]
+    if "/" in word:
+        if not os.path.isabs(word):
+            raise IsolationError(f"STRANGLER_LLM_CMD: {word!r} must be a bare name or an absolute path")
+        candidates = [word]
+    else:
+        candidates = [os.path.join(d, word) for d in search.split(":") if d]
+    for path in candidates:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o001:
+            continue
+        try:
+            check_link_target(path, Path("/"))
+        except IsolationError as exc:
+            raise IsolationError(f"STRANGLER_LLM_CMD: {path}: {exc}; {LLM_CLI_FIX}") from exc
+        return shlex.join([path, *words[1:]])
+    raise IsolationError(f"STRANGLER_LLM_CMD: {word!r} is not an executable on the service PATH {search!r}: "
+                         f"{LLM_CLI_FIX}")
+
+
+def check_ip_url(key: str, url: str) -> str:
+    """Validate a URL a component dials and return its canonical form, rebuilt from the parsed parts (the original
+    string is never forwarded, so no HTTP client can read it differently): http or https; host an IP literal
+    (loopback or remote, never a name such as ``localhost``, which may resolve to ::1 where any service user can
+    listen, and never an unspecified address); no user information; a valid port (the scheme's default if absent);
+    no backslash, whitespace or control character (``http://localhost:1\\@127.0.0.1:1/`` is read as localhost by
+    some clients); no query or fragment."""
     import ipaddress
     from urllib.parse import urlsplit
 
+    def refuse(why: str) -> IsolationError:
+        return IsolationError(f"{key}={url!r}: {why}; use an IP literal URL such as http://127.0.0.1:18000 (a name "
+                              "like localhost may resolve to ::1, where any service user could listen and collect "
+                              "credentials)")
+
+    if any(ch == "\\" or ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        raise refuse("backslash, whitespace or control character")
     try:
-        host = urlsplit(url.strip()).hostname or ""
-        ipaddress.ip_address(host)
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as exc:
+        raise refuse(f"unparsable ({exc})") from None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise refuse("only http and https are allowed")
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+        raise refuse("user information is not allowed")
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        raise refuse("no query or fragment")
+    try:
+        address = ipaddress.ip_address(parts.hostname or "")
     except ValueError:
-        raise IsolationError(f"{key}={url!r}: use an IP literal host (e.g. http://127.0.0.1:18000), not a name: "
-                             "localhost may resolve to ::1, where any service user could listen and collect "
-                             "credentials") from None
+        raise refuse("the host is not an IP literal") from None
+    if address.is_unspecified:
+        raise refuse("an unspecified address (0.0.0.0, ::) is not a destination")
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    if not 0 < port < 65536:
+        raise refuse("invalid port")
+    host = f"[{address}]" if address.version == 6 else str(address)
+    return f"{scheme}://{host}:{port}{parts.path}"
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -803,12 +892,89 @@ def _copy_file(src: Path, src_st: os.stat_result, dir_fd: int, name: str) -> Non
         os.close(sfd)
 
 
+_REMOVE_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def remove_tree_at(dir_fd: int, name: str, label: Path, errors: list[str]) -> None:
+    """Remove ``name`` (an entry of ``dir_fd``) and, if it is a directory, everything below it, iteratively with an
+    explicit stack: each subdirectory is opened O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK relative to its parent's
+    descriptor and fstat-checked against the entry that was listed; files and links are unlinked and directories
+    removed through their parent's descriptor. Never follows a symlink, never recurses on the Python stack. A failure
+    is recorded in ``errors`` (one line per entry) and the removal goes on with the rest."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        errors.append(f"{label}: {exc}")
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except OSError as exc:
+            errors.append(f"{label}: {exc}")
+        return
+
+    def open_dir(parent_fd: int, entry: str, expected: os.stat_result, entry_label: Path) -> int | None:
+        try:
+            fd = os.open(entry, _REMOVE_DIR_FLAGS, dir_fd=parent_fd)
+        except OSError as exc:
+            errors.append(f"{entry_label}: {exc}")
+            return None
+        got = os.fstat(fd)
+        if (got.st_dev, got.st_ino) != (expected.st_dev, expected.st_ino):
+            os.close(fd)
+            errors.append(f"{entry_label}: changed while being removed")
+            return None
+        return fd
+
+    def listing(fd: int, entry_label: Path) -> list[str]:
+        try:
+            return sorted(os.listdir(fd), reverse=True)
+        except OSError as exc:
+            errors.append(f"{entry_label}: {exc}")
+            return []
+
+    top = open_dir(dir_fd, name, st, label)
+    if top is None:
+        return
+    # each frame: (its descriptor, its parent's descriptor, its name there, its label, entries still to remove)
+    stack: list[tuple[int, int, str, Path, list[str]]] = [(top, dir_fd, name, label, listing(top, label))]
+    while stack:
+        fd, parent_fd, entry, entry_label, pending = stack[-1]
+        if not pending:
+            stack.pop()
+            os.close(fd)
+            try:
+                os.rmdir(entry, dir_fd=parent_fd)
+            except OSError as exc:
+                errors.append(f"{entry_label}: {exc}")
+            continue
+        child = pending.pop()
+        child_label = entry_label / child
+        try:
+            cst = os.stat(child, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{child_label}: {exc}")
+            continue
+        if stat.S_ISDIR(cst.st_mode):
+            cfd = open_dir(fd, child, cst, child_label)
+            if cfd is not None:
+                stack.append((cfd, fd, child, child_label, listing(cfd, child_label)))
+        else:
+            try:
+                os.unlink(child, dir_fd=fd)
+            except OSError as exc:
+                errors.append(f"{child_label}: {exc}")
+
+
 def _remove_any(dir_fd: int, name: str) -> None:
-    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-    if stat.S_ISDIR(st.st_mode):
-        shutil.rmtree(name, dir_fd=dir_fd)  # fd-based, never follows symlinks
-    else:
-        os.unlink(name, dir_fd=dir_fd)
+    errors: list[str] = []
+    remove_tree_at(dir_fd, name, Path(name), errors)
+    if errors:
+        raise IsolationError(f"could not remove {name}: {'; '.join(errors[:5])}")
 
 
 def _check_mirrored_link(top: Path, src_path: Path, target: str) -> None:
@@ -827,109 +993,107 @@ def _check_mirrored_link(top: Path, src_path: Path, target: str) -> None:
 MAX_LINK_DEPTH = 40
 
 
+def _components(text: str) -> list[str]:
+    return [p for p in text.split("/") if p not in ("", ".")]
+
+
 def _check_relative_link(top: Path, src_path: Path, target: str) -> None:
-    """A relative link is copied verbatim, so it must resolve inside its tree: resolved step by step (following
-    the links it meets, not lexically), it may never climb above ``top``. Once it meets an absolute link, the rest
-    of the resolution is outside the mirror and must pass ``check_link_target``."""
+    """A relative link is copied verbatim, so it must resolve inside its tree: resolved one component at a time
+    from a single queue (a link met on the way is expanded in front of the unconsumed suffix; never lexically), it
+    may never climb above ``top``. Once it meets an absolute link, that target plus the whole unconsumed suffix is
+    outside the mirror and must pass ``check_link_target``."""
+    from collections import deque
+
     inside = Path(os.path.realpath(top))
-    hops = [0]
 
     def refuse(why: str) -> IsolationError:
         return IsolationError(f"{src_path} -> {target}: {why}; refusing to mirror it")
 
-    def resolve(text: str, current: Path) -> Path | None:
-        parts = [p for p in text.split("/") if p not in ("", ".")]
-        for i, name in enumerate(parts):
-            last = i == len(parts) - 1
-            if name == "..":
-                if current == inside:
-                    raise refuse(f"it leaves {top}")
-                current = current.parent
-                continue
-            path = current / name
-            try:
-                st = os.lstat(path)
-            except FileNotFoundError:
-                return None  # dangling inside the tree: the mirrored copy dangles the same way
-            if stat.S_ISLNK(st.st_mode):
-                hops[0] += 1
-                if hops[0] > MAX_LINK_DEPTH:
-                    raise refuse(f"more than {MAX_LINK_DEPTH} symlinks")
-                inner = os.readlink(path)
-                if os.path.isabs(inner):
-                    try:
-                        check_link_target("/".join([inner.rstrip("/"), *parts[i + 1:]]), Path("/"))
-                    except IsolationError as exc:
-                        raise refuse(str(exc)) from exc
-                    return None
-                nxt = resolve(inner, current)
-                if nxt is None:
-                    return None
-                current = nxt
-            elif stat.S_ISDIR(st.st_mode):
-                current = path
-            elif last:
-                return path
-            else:
-                raise refuse(f"{path} is not a directory")
-        return current
-
-    start = Path(os.path.realpath(src_path.parent))
-    if start != inside and inside not in start.parents:
+    current = Path(os.path.realpath(src_path.parent))
+    if current != inside and inside not in current.parents:
         raise refuse(f"it is not inside {top}")
-    resolve(target, start)
+    queue = deque(_components(target))
+    hops = 0
+    while queue:
+        name = queue.popleft()
+        if name == "..":
+            if current == inside:
+                raise refuse(f"it leaves {top}")
+            current = current.parent
+            continue
+        path = current / name
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return  # dangling inside the tree: the mirrored copy dangles the same way, in root-only directories
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > MAX_LINK_DEPTH:
+                raise refuse(f"more than {MAX_LINK_DEPTH} symlinks")
+            inner = os.readlink(path)
+            if os.path.isabs(inner):
+                rest = "/" + "/".join([*_components(inner), *queue])
+                try:
+                    check_link_target(rest, Path("/"))
+                except IsolationError as exc:
+                    raise refuse(f"{rest}: {exc}") from exc
+                return
+            queue.extendleft(reversed(_components(inner)))  # relative to the link's own directory: current
+        elif stat.S_ISDIR(st.st_mode):
+            current = path
+        elif queue:
+            raise refuse(f"{path} is not a directory")
+        else:
+            return
 
 
 def check_link_target(target: str, base: Path) -> Path:
     """Resolve a symlink's ``target`` (relative ones from ``base``, the directory holding the link) as the kernel
-    would, and require that only root can change any step of that resolution: every directory traversed is root's
-    and not writable by others (a sticky one only as a pass-through to a root-owned entry), every symlink followed is
-    root's and is itself resolved the same way (up to MAX_LINK_DEPTH links), the final file, if present, is root's
-    and not writable by others, and a missing component is accepted only in a directory nobody else can write.
-    Mutable indirection is refused even if it currently points somewhere trustworthy. Returns the resolved path."""
-    check_trusted_path(base)
-    hops = [0]
+    would, one component at a time from a single queue (a link met on the way is expanded in front of the
+    unconsumed suffix), and require that only root can change any step of that resolution: every directory traversed
+    is root's and not writable by others (a sticky one only as a pass-through to a root-owned entry), every symlink
+    followed is root's (up to MAX_LINK_DEPTH links), the final file, if present, is root's and not writable by
+    others, and a missing component is accepted only in a directory nobody else can write. Mutable indirection is
+    refused even if it currently points somewhere trustworthy. Returns the resolved path."""
+    from collections import deque
 
-    def trusted(st: os.stat_result, path: Path, *, last: bool) -> None:
+    check_trusted_path(base)
+    current = Path("/") if target.startswith("/") else Path(os.path.normpath(base))
+    queue = deque(_components(target))
+    hops = 0
+    while queue:
+        name = queue.popleft()
+        if name == "..":
+            current = current.parent  # an ancestor of a checked directory: checked on the way down
+            continue
+        path = current / name
+        last = not queue
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            if os.lstat(current).st_mode & 0o022:
+                raise IsolationError(f"{path} is missing in {current}, which others can write") from None
+            return path  # dangling: only root could create it (or anything below it)
         if st.st_uid != 0:
             raise IsolationError(f"{path} is owned by uid {st.st_uid}, not root")
         if not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022 and not (
                 stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX and not last):
             raise IsolationError(f"{path} is group/other-writable (mode {stat.S_IMODE(st.st_mode):04o})")
-
-    def resolve(text: str, current: Path) -> Path:
-        if text.startswith("/"):
-            current = Path("/")
-        parts = [p for p in text.split("/") if p not in ("", ".")]
-        for i, name in enumerate(parts):
-            last = i == len(parts) - 1
-            if name == "..":
-                current = current.parent  # an ancestor of a checked directory: checked on the way down
-                continue
-            path = current / name
-            try:
-                st = os.lstat(path)
-            except FileNotFoundError:
-                if os.lstat(current).st_mode & 0o022:
-                    raise IsolationError(f"{path} is missing in {current}, which others can write") from None
-                return path  # dangling: only root could create it
-            trusted(st, path, last=last)
-            if stat.S_ISLNK(st.st_mode):
-                hops[0] += 1
-                if hops[0] > MAX_LINK_DEPTH:
-                    raise IsolationError(f"more than {MAX_LINK_DEPTH} symlinks resolving {target}")
-                current = resolve(os.readlink(path), current)
-                if not last and not os.path.isdir(current):
-                    raise IsolationError(f"{path} does not lead to a directory")
-            elif stat.S_ISDIR(st.st_mode):
-                current = path
-            elif last:
-                return path
-            else:
-                raise IsolationError(f"{path} is not a directory")
-        return current
-
-    return resolve(target, Path(os.path.normpath(base)))
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > MAX_LINK_DEPTH:
+                raise IsolationError(f"more than {MAX_LINK_DEPTH} symlinks resolving {target}")
+            inner = os.readlink(path)
+            if inner.startswith("/"):
+                current = Path("/")
+            queue.extendleft(reversed(_components(inner)))
+        elif stat.S_ISDIR(st.st_mode):
+            current = path
+        elif last:
+            return path
+        else:
+            raise IsolationError(f"{path} is not a directory")
+    return current
 
 
 def _mirror_dir(src: Path, dst_fd: int, label: Path, rel: str, actions: list[str], *, app: bool,
@@ -1127,7 +1291,7 @@ def reset(paths: ServicePaths, *, owners: Mapping[str, int] | None = None) -> li
                     for name in names:
                         try:
                             _unlink_at(dfd, name, paths.state / dirname / name, actions)
-                        except IsolationError as exc:  # e.g. a directory planted under that name: never abort
+                        except (IsolationError, OSError) as exc:  # e.g. a planted directory: never abort
                             actions.append(f"WARNING: {exc}; left in place")
                 finally:
                     os.close(dfd)
@@ -1146,8 +1310,9 @@ def clean_target(env: Mapping[str, str] | None = None) -> ServicePaths | None:
 
 
 def clean(paths: ServicePaths) -> list[str]:
-    """``make clean-state``: empty SERVICE_HOME/state. Every entry is first renamed (inside the root-only state
-    directory) out of the way, then removed with the fd-based, symlink-safe ``shutil.rmtree``."""
+    """``make clean-state``: empty SERVICE_HOME/state, the API-key copies (``agents/``) first. Every entry is first
+    renamed (inside the root-only state directory) out of the way, then removed by ``remove_tree_at``. A failure is
+    reported as an ``ERROR:`` line and the cleaning goes on with the other entries (the CLI then exits non-zero)."""
     actions: list[str] = []
     with _open_home(paths) as home_fd, _sync_locked(home_fd):
         try:
@@ -1158,11 +1323,19 @@ def clean(paths: ServicePaths) -> list[str]:
             st = os.fstat(state_fd)
             if st.st_uid != 0 or st.st_mode & 0o022:
                 raise IsolationError(f"{paths.state} must be owned by root and not group/other-writable")
-            for name in sorted(os.listdir(state_fd)):
-                trash = f".trash-{os.urandom(6).hex()}"
-                os.rename(name, trash, src_dir_fd=state_fd, dst_dir_fd=state_fd)
-                _remove_any(state_fd, trash)
-                actions.append(f"removed {paths.state / name}")
+            names = sorted(os.listdir(state_fd), key=lambda n: (n != "agents", n))
+            for name in names:
+                errors: list[str] = []
+                trash = name
+                if not name.startswith(".trash-"):
+                    trash = f".trash-{os.urandom(6).hex()}"
+                    try:
+                        os.rename(name, trash, src_dir_fd=state_fd, dst_dir_fd=state_fd)
+                    except OSError as exc:
+                        actions.append(f"ERROR: {paths.state / name}: {exc}")
+                        continue
+                remove_tree_at(state_fd, trash, paths.state / name, errors)
+                actions += [f"ERROR: {e}" for e in errors] or [f"removed {paths.state / name}"]
         finally:
             os.close(state_fd)
     return actions
@@ -1188,6 +1361,12 @@ def drop_privileges(uid: int, gid: int, groups: list[int]) -> None:
     groups = list(groups)
     if uid == 0 or gid == 0 or 0 in groups:
         raise IsolationError("refusing to 'drop' privileges to root")
+    # The uid change resets "dumpable" to fs.suid_dumpable. 1 would leave this process (root's environment and
+    # memory) readable by the target uid until the prctl below: refused. 0 and 2 keep it root-only throughout.
+    dumpable_policy = _suid_dumpable()
+    if dumpable_policy not in (0, 2):
+        raise IsolationError(f"fs.suid_dumpable is {dumpable_policy!r}: with 1, a process changing its uid is briefly "
+                             "readable by the new uid; set it to 0 or 2 (sysctl fs.suid_dumpable=0) first")
     if _prctl(_PR_SET_DUMPABLE, 0) != 0:
         raise IsolationError("cannot make the process non-dumpable")
     os.setgroups(groups)
@@ -1217,24 +1396,65 @@ def _prctl(option: int, arg: int) -> int:
     return _libc().prctl(option, arg, 0, 0, 0)
 
 
-_KEYCTL_SYSCALL = {"x86_64": 250, "aarch64": 219}
+def _suid_dumpable() -> int | None:
+    try:
+        with open("/proc/sys/fs/suid_dumpable", encoding="ascii") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+#: keyctl(2) syscall numbers (asm-generic for the newer architectures)
+_KEYCTL_SYSCALL = {"x86_64": 250, "i386": 288, "i686": 288, "aarch64": 219, "riscv64": 219, "loongarch64": 219,
+                   "ppc64le": 271, "ppc64": 271, "s390x": 280, "armv7l": 311, "armv8l": 311}
+_KEYCTL_GET_KEYRING_ID = 0
 _KEYCTL_JOIN_SESSION_KEYRING = 1
+_KEY_SPEC_SESSION_KEYRING = -3
 
 
-def _join_session_keyring() -> None:
-    """Leave the launcher's (root's) session keyring for a new anonymous one, so no key root holds is reachable.
-    Tolerated where keyrings are unavailable or refused (ENOSYS, EPERM, EKEYREVOKED); any other error is fatal."""
+def _keyctl(*args: int | None) -> tuple[int, int]:
+    """(return value, errno) of keyctl(*args); errno ENOSYS where this architecture's number is unknown."""
     import platform
 
     number = _KEYCTL_SYSCALL.get(platform.machine())
     if number is None:
-        return
+        return -1, errno.ENOSYS
     libc = _libc()
     libc.syscall.restype = ctypes.c_long
-    if libc.syscall(ctypes.c_long(number), ctypes.c_long(_KEYCTL_JOIN_SESSION_KEYRING), ctypes.c_void_p(None)) < 0:
-        err = ctypes.get_errno()
-        if err not in (errno.ENOSYS, errno.EPERM, errno.EKEYREVOKED):
-            raise IsolationError(f"cannot join a new session keyring: {os.strerror(err)}")
+    argv = [ctypes.c_long(number)] + [ctypes.c_void_p(None) if a is None else ctypes.c_long(a) for a in args]
+    ret = libc.syscall(*argv)
+    return ret, (ctypes.get_errno() if ret < 0 else 0)
+
+
+def _no_inherited_keyring() -> bool:
+    """Proof that there is no session keyring to leave: the kernel lists no key for us (/proc/keys absent or empty)
+    and asking for the session keyring without creating it fails."""
+    try:
+        with open("/proc/keys", encoding="ascii", errors="replace") as fh:
+            if fh.read().strip():
+                return False
+    except FileNotFoundError:
+        pass  # no keys facility at all
+    except OSError:
+        return False
+    ret, _err = _keyctl(_KEYCTL_GET_KEYRING_ID, _KEY_SPEC_SESSION_KEYRING, 0)
+    return ret < 0
+
+
+def _join_session_keyring() -> None:
+    """Leave the launcher's (root's) session keyring for a new anonymous one, so no key root holds is reachable.
+    Fails closed: only ENOSYS (no keys facility) and EKEYREVOKED (the inherited keyring is already revoked) are
+    tolerated; any other failure (EPERM, an unknown architecture) is an error unless there is provably no inherited
+    session keyring."""
+    ret, err = _keyctl(_KEYCTL_JOIN_SESSION_KEYRING, None)
+    if ret >= 0 or err == errno.EKEYREVOKED:
+        return
+    if err == errno.ENOSYS and not os.path.exists("/proc/keys"):
+        return  # the kernel has no keys facility
+    if _no_inherited_keyring():
+        return
+    raise IsolationError(f"cannot leave the inherited session keyring ({os.strerror(err)}); refusing to run "
+                         "with root's keys reachable")
 
 
 def close_inherited_fds() -> None:
@@ -1530,14 +1750,58 @@ def setup(env: Mapping[str, str] | None = None, *, service_home: Path | str | No
             if not ok:
                 raise IsolationError(f"startup smoke failed for {comp.name} (marker left at setting-up): {output}")
             actions.append(f"{comp.name}: startup smoke import of {comp.module} as {comp.user} passed")
-    llm = llm_cli_check(resolve(COMPONENTS["translator"]), values)
+    llm = llm_cli_check(resolve(COMPONENTS["translator"]), paths, values)
     if llm.status == "FAIL":
         raise IsolationError(f"STRANGLER_TRANSLATOR_MODE=llm: {llm.actual} (marker left at setting-up)")
     if llm.status == "PASS":
         actions.append(f"translator: LLM CLI {llm.actual} runs as sr-translator")
     marker.update(state="ready", updated=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     actions.append(f"marker {write_marker(marker, values)}: ready")
+    actions += layout_notes(_checkout_state_items(values), "the checkout", "the service area")
     return actions
+
+
+FRESH_HINT = "start from a clean state with `scripts/targets.sh start --fresh` (or `make demo`)"
+
+
+def _checkout_state_items(values: Mapping[str, str]) -> list[Path]:
+    """Component state of the unisolated layout (the checkout's .state and generated module) that exists."""
+    state = repo_state_dir(values)
+    raw = (values.get("MODERN_LISTS_PATH") or "").strip()
+    module = Path(os.path.normpath(repo_root() / raw)) if raw else (
+        repo_root() / "targets" / "modern_fastapi" / "app" / "lists.py")
+    items = [state / "proxy" / "router.json", state / "fuzzer", state / "translator", module]
+    return [p for p in items if _has_content(p)]
+
+
+def _service_state_items(paths: ServicePaths) -> list[Path]:
+    """Component state of the isolated layout (the service area) that exists."""
+    items = [paths.private("proxy") / "router.json", paths.private("fuzzer"), paths.private("translator"),
+             paths.module_file]
+    return [p for p in items if _has_content(p)]
+
+
+def _has_content(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISDIR(st.st_mode):
+        try:
+            return bool(os.listdir(path))
+        except OSError:
+            return True
+    return True
+
+
+def layout_notes(items: Sequence[Path], left: str, entered: str) -> list[str]:
+    """Loud notes for a mode switch: component state that stays behind in the layout being left does not carry
+    over to the other one (routing, divergence registry, pending refusals, the generated module)."""
+    if not items:
+        return []
+    return [f"NOTE: this component state stays in {left} and does not carry over to {entered}: "
+            + ", ".join(str(p) for p in items),
+            f"NOTE: {FRESH_HINT}"]
 
 
 def disable(env: Mapping[str, str] | None = None, *, purge: bool = False,
@@ -1557,6 +1821,8 @@ def disable(env: Mapping[str, str] | None = None, *, purge: bool = False,
         actions.append(f"no marker at {marker_path(values)}")
     paths = service_paths((marker or {}).get("service_home") or DEFAULT_SERVICE_HOME)
     actions += remove_key_copies(paths)  # API keys never outlive isolation, purge or not
+    actions += layout_notes(_service_state_items(paths), "the service area" + (" (now removed)" if purge else ""),
+                            "the checkout")
     if purge:
         actions += _purge_home(paths)
         for comp in COMPONENTS.values():
@@ -1600,13 +1866,34 @@ def _purge_home(paths: ServicePaths) -> list[str]:
     extra = sorted(set(os.listdir(paths.home)) - {"app", "venv", "state", ".sync.lock"})
     if extra:
         raise IsolationError(f"{paths.home} holds unexpected entries {extra}: not removing it")
-    pfd = _openat_dir(None, paths.home.parent, paths.home.parent)
+    pfd = open_trusted_dir(paths.home.parent)
+    if pfd is None:
+        return [f"{paths.home.parent} does not exist"]
+    errors: list[str] = []
     try:
         trash = f".{paths.home.name}.purge-{os.urandom(6).hex()}"
         os.rename(paths.home.name, trash, src_dir_fd=pfd, dst_dir_fd=pfd)
-        shutil.rmtree(trash, dir_fd=pfd)
+        # the API-key copies first, then the rest
+        try:
+            tfd = os.open(trash, _REMOVE_DIR_FLAGS, dir_fd=pfd)
+        except OSError:
+            tfd = None
+        if tfd is not None:
+            try:
+                sfd = os.open("state", _REMOVE_DIR_FLAGS, dir_fd=tfd)
+            except OSError:
+                sfd = None
+            if sfd is not None:
+                try:
+                    remove_tree_at(sfd, "agents", paths.agents, errors)
+                finally:
+                    os.close(sfd)
+            os.close(tfd)
+        remove_tree_at(pfd, trash, paths.home, errors)
     finally:
         os.close(pfd)
+    if errors:
+        raise IsolationError(f"could not remove all of {paths.home}: " + "; ".join(errors[:10]))
     return [f"removed {paths.home}"]
 
 
@@ -1845,24 +2132,38 @@ def smoke(component: Component | str, ids: Ids, paths: ServicePaths, *, timeout:
     return ok, output.decode("utf-8", "replace").strip()[-800:]
 
 
-def scan_candidates(roots: Iterable[str | Path], *, max_bytes: int = SCAN_MAX_BYTES) -> list[tuple[str, list[str]]]:
-    """(directory, [regular files <= max_bytes and symlinks]) for every directory under ``roots``, listed as root
-    by descriptor (not ``os.fwalk``, which opens a symlinked directory before checking it): each subdirectory is
-    opened O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK relative to its parent's descriptor, so a directory a service swaps for
-    a symlink (or a device) mid-walk is neither followed nor opened. Root only lists names here; it never opens a
+SCAN_MAX_DEPTH = 1024
+#: per subject: the scan reads at most this much in all; reaching a cap fails verification (coverage incomplete)
+SCAN_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+SCAN_MAX_FILES = 1_000_000
+SCAN_CHUNK = 1024 * 1024
+
+
+def scan_candidates(roots: Iterable[str | Path], *, problems: list[str] | None = None,
+                    max_depth: int | None = None) -> list[tuple[str, list[str]]]:
+    """(directory, [regular files and symlinks]) for every directory under ``roots``, listed as root by an iterative
+    descriptor walk (not ``os.fwalk``, which opens a symlinked directory before checking it): each subdirectory is
+    opened O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK relative to its parent's descriptor, so a directory a service swaps for a
+    symlink (or a device) mid-walk is neither followed nor opened. Directories deeper than ``max_depth`` are not
+    listed; each is reported in ``problems`` (verify fails on it). Root only lists names here; it never opens a
     candidate nor resolves a link (only the dropped child does, ``search_readable``)."""
+    max_depth = SCAN_MAX_DEPTH if max_depth is None else max_depth
     out: list[tuple[str, list[str]]] = []
     seen: set[str] = set()
+    flags = _DIR_FLAGS | os.O_NONBLOCK
+    # each frame: (descriptor, path, depth, subdirectory names still to visit)
+    stack: list[tuple[int, str, int, list[str]]] = []
 
-    def walk(fd: int, path: str, depth: int) -> None:
-        if path in seen or depth > 256:
+    def enter(fd: int, path: str, depth: int) -> None:
+        if path in seen:
+            os.close(fd)
             return
         seen.add(path)
         files, subdirs = [], []
         try:
             names = sorted(os.listdir(fd))
         except OSError:
-            return
+            names = []
         for name in names:
             try:
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -1870,29 +2171,35 @@ def scan_candidates(roots: Iterable[str | Path], *, max_bytes: int = SCAN_MAX_BY
                 continue
             if stat.S_ISDIR(st.st_mode):
                 subdirs.append(name)
-            elif (stat.S_ISREG(st.st_mode) and st.st_size <= max_bytes) or stat.S_ISLNK(st.st_mode):
+            elif stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
                 files.append(name)
         out.append((path, files))
-        for name in subdirs:
-            try:
-                child = os.open(name, _DIR_FLAGS | os.O_NONBLOCK, dir_fd=fd)
-            except OSError:
-                continue
-            try:
-                walk(child, os.path.join(path, name), depth + 1)
-            finally:
-                os.close(child)
+        stack.append((fd, path, depth, subdirs[::-1]))
 
     for root in roots:
         root = os.path.normpath(str(root))
         try:
-            fd = os.open(root, _DIR_FLAGS | os.O_NONBLOCK)
+            root_fd = os.open(root, flags)
         except OSError:
             continue
-        try:
-            walk(fd, root, 0)
-        finally:
-            os.close(fd)
+        enter(root_fd, root, 0)
+        while stack:
+            fd, path, depth, pending = stack[-1]
+            if not pending:
+                stack.pop()
+                os.close(fd)
+                continue
+            name = pending.pop()
+            child_path = os.path.join(path, name)
+            if depth + 1 > max_depth:
+                if problems is not None:
+                    problems.append(f"{child_path}: deeper than {max_depth} levels, not scanned")
+                continue
+            try:
+                child = os.open(name, flags, dir_fd=fd)
+            except OSError:
+                continue
+            enter(child, child_path, depth + 1)
     return out
 
 
@@ -1902,18 +2209,26 @@ LINK_WALK_MAX_BYTES = 512 * 1024 * 1024
 
 
 def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Mapping[str, bytes], *,
-                    own_key: str | None = None, max_bytes: int = SCAN_MAX_BYTES,
-                    link_max_files: int = LINK_WALK_MAX_FILES,
-                    link_max_bytes: int = LINK_WALK_MAX_BYTES) -> dict[str, Any]:
+                    own_key: str | None = None, link_max_files: int | None = None,
+                    link_max_bytes: int | None = None, max_total_bytes: int | None = None,
+                    max_files: int | None = None, chunk: int | None = None) -> dict[str, Any]:
     """As the current (dropped) user: read every candidate it can (the kernel decides) and search it for every
     secret value. Each candidate is opened ``O_PATH`` (following a symlink as this user only; no side effects even
     on a device node), checked with fstat to be a regular file, and only then reopened for reading through that
-    descriptor. A candidate that leads to a directory (a directory symlink) is walked here, as this user, with a
-    (st_dev, st_ino) visited set and the ``link_max_*`` caps. Returns the number of files read, [path, [labels],
-    is-own-key-copy] for each hit (never a value) and whether a cap cut a walk short."""
+    descriptor. Files of any size are searched in streamed chunks that overlap by the longest secret's length. A
+    candidate that leads to a directory (a directory symlink) is walked here, as this user, with a (st_dev, st_ino)
+    visited set and the ``link_max_*`` caps. Reaching any cap is reported in ``truncated`` (verify fails). Returns
+    the number of files read, [path, [labels], is-own-key-copy] for each hit (never a value) and ``truncated``."""
+    link_max_files = LINK_WALK_MAX_FILES if link_max_files is None else link_max_files
+    link_max_bytes = LINK_WALK_MAX_BYTES if link_max_bytes is None else link_max_bytes
+    max_total_bytes = SCAN_MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
+    max_files = SCAN_MAX_FILES if max_files is None else max_files
+    chunk = SCAN_CHUNK if chunk is None else chunk
     by_value: dict[bytes, list[str]] = {}
     for label, value in secrets.items():
-        by_value.setdefault(value, []).append(label)
+        if value:
+            by_value.setdefault(value, []).append(label)
+    overlap = max((len(v) for v in by_value), default=1) - 1
     own_id = None
     if own_key:
         try:
@@ -1928,14 +2243,39 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
             visited.add((dst.st_dev, dst.st_ino))
         except OSError:
             pass
-    state: dict[str, Any] = {"read": 0, "hits": [], "truncated": False, "link_files": 0, "link_bytes": 0}
+    state: dict[str, Any] = {"read": 0, "hits": [], "truncated": [], "bytes": 0, "link_files": 0, "link_bytes": 0}
+
+    def truncate(why: str) -> None:
+        if why not in state["truncated"]:
+            state["truncated"].append(why)
+
+    def search(fd: int) -> set[str]:
+        found: set[str] = set()
+        tail = b""
+        while True:
+            if state["bytes"] >= max_total_bytes:
+                truncate(f"total read cap of {max_total_bytes} bytes reached")
+                return found
+            try:
+                data = os.read(fd, chunk)
+            except OSError:
+                return found
+            if not data:
+                return found
+            state["bytes"] += len(data)
+            window = tail + data
+            for value, labels in by_value.items():
+                if value in window:
+                    found.update(labels)
+            tail = window[-overlap:] if overlap > 0 else b""
 
     def read_one(path: str, pfd: int, st: os.stat_result, via_link_walk: bool) -> None:
-        if st.st_size > max_bytes:
+        if state["read"] >= max_files:
+            truncate(f"file cap of {max_files} reached")
             return
         if via_link_walk:
             if state["link_files"] >= link_max_files or state["link_bytes"] + st.st_size > link_max_bytes:
-                state["truncated"] = True
+                truncate(f"symlinked directories walked within {link_max_files} files / {link_max_bytes >> 20} MiB")
                 return
             state["link_files"] += 1
             state["link_bytes"] += st.st_size
@@ -1944,15 +2284,12 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
         except OSError:
             return
         try:
-            data = os.read(fd, max_bytes + 1)[:max_bytes]
-        except OSError:
-            return
+            found = search(fd)
         finally:
             os.close(fd)
         state["read"] += 1
-        found = [label for value, labels in by_value.items() if value in data for label in labels]
         if found:
-            state["hits"].append([path, found, (st.st_dev, st.st_ino) == own_id])
+            state["hits"].append([path, sorted(found), (st.st_dev, st.st_ino) == own_id])
 
     def visit(path: str, stack: list[tuple[str, tuple[int, int]]] | None) -> None:
         try:
@@ -1974,7 +2311,7 @@ def search_readable(candidates: Sequence[tuple[str, Sequence[str]]], secrets: Ma
 
     def walk(top: str, key: tuple[int, int]) -> None:
         stack = [(top, key)]
-        while stack and not state["truncated"]:
+        while stack:
             dirpath, key = stack.pop()
             if key in visited:
                 continue
@@ -1998,14 +2335,20 @@ def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: 
                 own_keys: Mapping[str, str] | None = None) -> list[Row]:
     """§6.4: as each subject, a forked child reads every candidate it can (the kernel decides), following symlinks
     only as that user, and searches it for every secret value. A hit fails unless it is the subject's own API key
-    in its own key copy (``own_keys``: subject -> path; matched by inode, so an alias of the copy is no hit). A
-    symlinked-directory walk cut short by its caps fails: the scan is then incomplete."""
+    in its own key copy (``own_keys``: subject -> path; matched by inode, so an alias of the copy is no hit).
+    Incomplete coverage (a directory too deep to list, a cap reached) fails, and the summary never passes then."""
     rows: list[Row] = []
     usable = {k: v.encode() for k, v in secrets.items() if len(v) >= MIN_SECRET_LEN}
     for label in sorted(set(secrets) - set(usable)):
         rows.append(Row("secrets", "-", f"{label}: shorter than {MIN_SECRET_LEN} characters, not scanned", "-", "-",
                         "SKIP"))
-    candidates = scan_candidates(roots)
+    problems: list[str] = []
+    candidates = scan_candidates(roots, problems=problems)
+    for problem in problems[:20]:
+        rows.append(Row("secrets", "-", f"incomplete listing: {problem}", "complete", "incomplete", "FAIL"))
+    if len(problems) > 20:
+        rows.append(Row("secrets", "-", f"... {len(problems) - 20} more incomplete listings", "complete",
+                        "incomplete", "FAIL"))
     for subject, ids in subjects.items():
         own_key = (own_keys or {}).get(subject)
         result = run_as(ids, lambda key=own_key: search_readable(candidates, usable, own_key=key), timeout=1800.0)
@@ -2017,11 +2360,12 @@ def secret_scan(subjects: Mapping[str, Ids], secrets: Mapping[str, str], roots: 
         for path, labels in bad:
             rows.append(Row("secrets", subject, f"{path} exposes {', '.join(sorted(set(labels)))}", "no", "yes",
                             "FAIL"))
+        for why in result["truncated"]:
+            rows.append(Row("secrets", subject, f"scan incomplete: {why}", "complete", "cut short", "FAIL"))
+        complete = not result["truncated"] and not problems
         rows.append(Row("secrets", subject, f"{result['read']} readable files searched for {len(usable)} secret "
-                        "values", "0 hits", f"{len(bad)} hits", "PASS" if not bad else "FAIL"))
-        if result["truncated"]:
-            rows.append(Row("secrets", subject, f"symlinked directories walked within {LINK_WALK_MAX_FILES} files / "
-                            f"{LINK_WALK_MAX_BYTES >> 20} MiB", "complete", "cut short", "FAIL"))
+                        "values", "0 hits, complete", f"{len(bad)} hits" + ("" if complete else ", incomplete"),
+                        "PASS" if not bad and complete else "FAIL"))
     return rows
 
 
@@ -2071,17 +2415,17 @@ def secret_values(repo_state: Path, repo: Path, *, env: Mapping[str, str] | None
             continue
         if isinstance(data, dict) and data.get("api_key"):
             out[f"api-key:{comp.name}"] = str(data["api_key"])
-    datasources = [values.get("MM_SQLSETTINGS_DATASOURCE") or "",
-                   _read_env_file(repo / ".native" / "mm-env.sh").get("MM_SQLSETTINGS_DATASOURCE", "")]
+    datasources = {"env": values.get("MM_SQLSETTINGS_DATASOURCE") or "",
+                   "mm-env.sh": _read_env_file(repo / ".native" / "mm-env.sh").get("MM_SQLSETTINGS_DATASOURCE", "")}
     try:
         config = json.loads(_read_source(repo / ".native" / "mattermost" / "config" / "config.json") or b"{}")
-        datasources.append(str((config.get("SqlSettings") or {}).get("DataSource") or ""))
+        datasources["config.json"] = str((config.get("SqlSettings") or {}).get("DataSource") or "")
     except (ValueError, AttributeError, IsolationError):
         pass
-    for ds in datasources:
+    for source, ds in datasources.items():  # each under its own label: they may differ, and all are searched
         password = _datasource_password(ds) if ds else None
         if password:
-            out["mattermost-db-password"] = password
+            out[f"mattermost-db-password:{source}"] = password
     return {k: v for k, v in out.items() if v}
 
 
@@ -2127,16 +2471,20 @@ def process_checks(subjects: Mapping[str, Ids], secrets: Mapping[str, str], pids
     checked: list[tuple[str, int]] = []
     for name in subjects:
         found = sorted(instances.get(name, []))
-        if not found:
+        tracked = pids.get(name)
+        if not found and tracked is None:
             rows.append(Row("process", name, "running", "yes", "no", "SKIP"))
             continue
         if len(found) > 1:
             rows.append(Row("process", name, f"exactly one instance of {COMPONENTS[name].module}", "1",
                             f"{len(found)}: pids {found}", "FAIL"))
+        if tracked is not None:  # validated whatever its argv says (a process can rewrite its argv)
+            checked.append((name, tracked))
         for pid in found:
-            rows.append(_row("process", name, f"pid {pid} is the tracked instance (pid file: {pids.get(name)})", True,
-                             pid == pids.get(name)))
-            checked.append((name, pid))
+            if pid != tracked:
+                rows.append(_row("process", name, f"pid {pid} is the tracked instance (pid file: {tracked})", True,
+                                 False))
+                checked.append((name, pid))
     for name, pid in checked:
         ids = subjects[name]
         status = _proc_status(pid) or {}
@@ -2159,6 +2507,15 @@ def process_checks(subjects: Mapping[str, Ids], secrets: Mapping[str, str], pids
         status = _proc_status(pid)
         if status and status["Uid"][1] in uid_owner:
             owned.setdefault(uid_owner[status["Uid"][1]], []).append(pid)
+    # every process of a service uid must be its tracked component or a descendant of it (uvicorn's reload worker
+    # and resource tracker are the modern server's children; an LLM CLI is the translator's)
+    tracked_by_name = {name: pid for name, pid in pids.items() if name in subjects}
+    for name, owned_pids in owned.items():
+        for pid in owned_pids:
+            if not _descends_from(pid, tracked_by_name.get(name)):
+                cmd = (_proc_bytes(pid, "cmdline") or b"").replace(b"\0", b" ").decode("utf-8", "replace")[:80]
+                rows.append(Row("process", name, f"unexplained process of {COMPONENTS[name].user}: pid {pid} "
+                                f"({cmd.strip()})", "none", "running", "FAIL"))
     for name, owned_pids in owned.items():
         # /proc/<pid>/environ of another uid needs CAP_SYS_PTRACE, which root may lack (it does in this pod): read it
         # as the process's own user, in a forked child. Only labels and flags come back, never values.
@@ -2177,6 +2534,43 @@ def process_checks(subjects: Mapping[str, Ids], secrets: Mapping[str, str], pids
                 rows.append(Row("process", name, f"pid {pid} environment exposes {', '.join(exposed)}", "no", "yes",
                                 "FAIL"))
     return rows
+
+
+def _ppid(pid: int) -> int | None:
+    raw = _proc_bytes(pid, "stat")
+    if not raw:
+        return None
+    try:
+        return int(raw[raw.rindex(b")") + 2:].split()[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _descends_from(pid: int, ancestor: int | None) -> bool:
+    """Is ``pid`` the ``ancestor`` process itself or one of its descendants (following parent pids)?"""
+    if ancestor is None:
+        return False
+    seen: set[int] = set()
+    current: int | None = pid
+    while current and current not in seen:
+        if current == ancestor:
+            return True
+        seen.add(current)
+        current = _ppid(current)
+    return False
+
+
+def tracked_pid(component: Component | str, env: Mapping[str, str] | None = None) -> int | None:
+    """The live pid recorded in the component's pid file, whatever its argv now says (a process can rewrite its
+    argv; verify then checks it by uid and session)."""
+    comp = _component(component)
+    try:
+        raw = (run_dir_for(comp, env) / f"{comp.name}.pid").read_text().strip()
+    except OSError:
+        return None
+    if not raw.isdigit() or int(raw) <= 0 or _proc_status(int(raw)) is None:
+        return None
+    return int(raw)
 
 
 _TOKEN_LABELS = frozenset({"ROUTER_ADMIN_TOKEN", "router.token", "ROUTER_TOKEN_FILE"})
@@ -2360,34 +2754,62 @@ def listener_checks(expected: Mapping[int, tuple[str, int | None]],
     return rows
 
 
+#: the components' own defaults for the endpoints they dial (agents/runtime.py, targets/proxy/router.py), and the
+#: ports scripts/targets.sh binds
+_ENDPOINT_DEFAULTS = {"PROXY_URL": "http://127.0.0.1:9000", "LEGACY_URL": "http://127.0.0.1:9001",
+                      "MODERN_URL": "http://127.0.0.1:9002"}
+_ENDPOINT_OWNER = {"SWITCH_URL": "switch", "PROXY_URL": "proxy", "LEGACY_URL": "legacy", "MODERN_URL": "modern"}
+
+
 def _expected_listeners(values: Mapping[str, str]) -> dict[int, tuple[str, int | None]]:
+    """port -> (owner, uid) for every local endpoint a component dials, as it will actually dial it (environment or
+    the component's default, canonical form, scheme default port) plus the ports targets.sh binds. Only loopback
+    endpoints are local; remote ones are not checked. Two owners expected on one port is an error."""
+    import ipaddress
     from urllib.parse import urlsplit
 
-    switch_port = urlsplit(resolve_switch_url(values)).port or 80
-    expected: dict[int, tuple[str, int | None]] = {switch_port: ("switch", 0)}
-    for name, port in (("proxy", 9000), ("legacy", 9001), ("modern", 9002)):
-        pw = _lookup(pwd.getpwnam, COMPONENTS[name].user)
-        expected[port] = (name, pw.pw_uid if pw else None)
+    def uid_of(owner: str) -> int | None:
+        if owner == "switch":
+            return 0
+        pw = _lookup(pwd.getpwnam, COMPONENTS[owner].user)
+        return pw.pw_uid if pw else None
+
+    wanted: list[tuple[int, str]] = []
+    for key, owner in _ENDPOINT_OWNER.items():
+        raw = resolve_switch_url(values) if key == "SWITCH_URL" else (values.get(key) or _ENDPOINT_DEFAULTS[key])
+        url = urlsplit(check_ip_url(key, raw))
+        if ipaddress.ip_address(url.hostname or "").is_loopback:
+            wanted.append((url.port or 80, owner))
+    wanted += [(9000, "proxy"), (9001, "legacy"), (9002, "modern")]
+    expected: dict[int, tuple[str, int | None]] = {}
+    for port, owner in wanted:
+        if port in expected and expected[port][0] != owner:
+            raise IsolationError(f"port {port} is expected to belong to both {expected[port][0]} and {owner}: fix "
+                                 "the *_URL settings")
+        expected[port] = (owner, uid_of(owner))
     return expected
 
 
-LLM_CLI_FIX = ("install the LLM CLI outside /root (root-owned, e.g. /usr/local/bin) and pass its key with "
-               "STRANGLER_TRANSLATOR_PASS_ENV")
+def smoke_row(component: Component | str, ids: Ids, paths: ServicePaths) -> Row:
+    """§6.3 as a verify row; a missing service interpreter is a failure, never a missing row."""
+    comp = _component(component)
+    check = f"{paths.python} imports {comp.module} as {comp.user}"
+    if not os.path.lexists(paths.python):
+        return Row("smoke", comp.name, check, "ok", "no service interpreter (run `make isolate`)", "FAIL")
+    ok, output = smoke(comp, ids, paths)
+    return Row("smoke", comp.name, check, "ok", "ok" if ok else (output.splitlines() or ["failed"])[-1][:60],
+               "PASS" if ok else "FAIL")
 
 
-def _find_executable(word: str, search: str) -> str | None:
-    """As the current (dropped) user: where ``word`` resolves on ``search`` (a PATH), if executable for it."""
-    candidates = [word] if "/" in word else [os.path.join(d or ".", word) for d in search.split(":")]
-    for path in candidates:
-        if os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
+def _executable(path: str) -> bool:
+    """As the current (dropped) user: can it execute ``path``?"""
+    return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def llm_cli_check(ids: Ids, env: Mapping[str, str] | None = None) -> Row:
-    """In LLM mode the translator runs ``STRANGLER_LLM_CMD``: its first word must resolve, as the translator's user
-    and on the translator's PATH, to an executable whose whole resolution chain only root can modify. SKIP in the
-    deterministic mode."""
+def llm_cli_check(ids: Ids, paths: ServicePaths, env: Mapping[str, str] | None = None) -> Row:
+    """In LLM mode the translator runs ``STRANGLER_LLM_CMD`` as pinned by its real child environment (``child_env``:
+    the service PATH, the first word resolved to an absolute path with a root-only chain); that executable must also
+    run for sr-translator. SKIP in the deterministic mode."""
     import shlex
 
     values = _values(env)
@@ -2395,20 +2817,15 @@ def llm_cli_check(ids: Ids, env: Mapping[str, str] | None = None) -> Row:
     check = "LLM CLI (first word of STRANGLER_LLM_CMD) runs for sr-translator"
     if mode != "llm":
         return Row("smoke", "translator", check, "-", f"mode {mode}", "SKIP")
-    from agents.llm_synth import DEFAULT_LLM_CMD
-
-    words = shlex.split(values.get("STRANGLER_LLM_CMD") or DEFAULT_LLM_CMD)
-    if not words:
-        return Row("smoke", "translator", check, "found", f"empty command; {LLM_CLI_FIX}", "FAIL")
-    found = run_as(ids, _find_executable, words[0], values.get("PATH") or "/usr/bin:/bin")
-    if found is None:
-        return Row("smoke", "translator", check, "found", f"{words[0]} not found or not executable for "
-                   f"sr-translator: {LLM_CLI_FIX}", "FAIL")
     try:
-        check_link_target(found, Path("/"))
+        child = child_env("translator", values, paths=paths, switch_url=resolve_switch_url(values))
     except IsolationError as exc:
-        return Row("smoke", "translator", check, "root-only", f"{found}: {exc}; {LLM_CLI_FIX}", "FAIL")
-    return Row("smoke", "translator", check, "found", found, "PASS")
+        return Row("smoke", "translator", check, "found", str(exc), "FAIL")
+    executable = shlex.split(child["STRANGLER_LLM_CMD"])[0]
+    if not run_as(ids, _executable, executable):
+        return Row("smoke", "translator", check, "found", f"{executable} is not executable for sr-translator: "
+                   f"{LLM_CLI_FIX}", "FAIL")
+    return Row("smoke", "translator", check, "found", executable, "PASS")
 
 
 def verify(env: Mapping[str, str] | None = None, *, roots: Iterable[str] = SCAN_ROOTS) -> tuple[bool, list[Row]]:
@@ -2425,16 +2842,12 @@ def verify(env: Mapping[str, str] | None = None, *, roots: Iterable[str] = SCAN_
             subjects[comp.name] = resolve_ids(comp)
         except IsolationError as exc:
             rows.append(Row("access", comp.name, "resolve ids", "ok", str(exc), "FAIL"))
-    pids = {name: pid for name in subjects if (pid := live_pid(name, values)) is not None}
+    pids = {name: pid for name in subjects if (pid := tracked_pid(name, values)) is not None}
     for name, ids in subjects.items():
         rows += run_probes(name, ids, access_probes(name, paths, repo_state, pids=pids))
-        if os.path.lexists(paths.python):
-            ok, output = smoke(name, ids, paths)
-            comp = COMPONENTS[name]
-            rows.append(Row("smoke", name, f"{paths.python} imports {comp.module} as {comp.user}", "ok",
-                            "ok" if ok else (output.splitlines() or ["failed"])[-1][:60], "PASS" if ok else "FAIL"))
+        rows.append(smoke_row(name, ids, paths))
     if "translator" in subjects:
-        rows.append(llm_cli_check(subjects["translator"], values))
+        rows.append(llm_cli_check(subjects["translator"], paths, values))
     secrets = secret_values(repo_state, repo_root(), env=values)
     if subjects:
         rows += secret_scan(subjects, secrets, [str(paths.home), *roots],
@@ -2479,7 +2892,7 @@ def status_lines(env: Mapping[str, str] | None = None) -> list[str]:
     for comp in COMPONENTS.values():
         pw = _lookup(pwd.getpwnam, comp.user)
         user = f"{comp.user} uid {pw.pw_uid}" if pw else f"{comp.user} (no such user)"
-        pid = live_pid(comp, values)
+        pid = tracked_pid(comp, values)
         if pid is None:
             proc = "not running"
         else:
@@ -2540,11 +2953,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if paths is None:
                 print("no service area: nothing to clean")
                 return 0
-            _require_root(cmd)
+            if os.geteuid() != 0:  # e.g. `make clean-state` as a normal user: its own .state is still cleaned
+                print("not root: leaving the service area alone (run make clean-state as root to empty it)")
+                return 0
             _refuse_while_running("clean", None)
-            for line in clean(paths):
-                print(line)
-            return 0
+            lines = clean(paths)
+            for line in lines:
+                print(line, file=sys.stderr if line.startswith("ERROR:") else sys.stdout)
+            return 1 if any(line.startswith("ERROR:") for line in lines) else 0
         if cmd == "verify" and not rest:
             ok, rows = verify()
             print(format_table(rows))
