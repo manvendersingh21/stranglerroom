@@ -219,7 +219,7 @@ def run_peer(c: dict, ws: Path, prompt: str, log: Path) -> int:
                      f"command({ws}/.venv/bin/pytest)", f"command({ws}/.venv/bin/python)"]
             allow += [f"command({x})" for x in AGY_READONLY]
             # agy's own file tools need explicit rules in headless mode (they cannot prompt): read-only, workspace only
-            allow += [f"read_file({ws})", f"read_file({ws}/**)", f"list_dir({ws})", f"list_dir({ws}/**)"]
+            allow += [f"read_file({ws})"]  # agy's rule form: read_file(<absolute_path>), a directory covers its tree
             cmd = ["agy", "-p", prompt, "--mode", "accept-edits", "--settings",
                    json.dumps({"permissions": {"allow": allow}}), "--model", model]
             if model.startswith("gemini"):  # agy rejects --effort for models with a fixed thinking budget
