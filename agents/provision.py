@@ -18,8 +18,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from agents.switch_client import STATE_DIR, AgentCredentials, Settings, SwitchAgent, SwitchGateway, register_agent
 
@@ -57,8 +60,21 @@ class RoomInfo:
         return STATE_DIR / "room.json"
 
     def save(self) -> None:
-        self.path().parent.mkdir(parents=True, exist_ok=True)
-        self.path().write_text(json.dumps(asdict(self), indent=2))
+        """Atomically publish ``room.json`` as 0644 whatever the umask: every agent reads it, and when isolated
+        each agent is another OS user (docs/ISOLATION.md). It holds no secret (ids, names, the channel URL)."""
+        path = self.path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".room.json.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(asdict(self), indent=2))
+                fh.flush()
+                os.fchmod(fh.fileno(), 0o644)
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     @classmethod
     def load(cls) -> "RoomInfo":

@@ -237,13 +237,37 @@ def _connection_tokens(headers: Iterable[tuple[str, str]]) -> set[str]:
     return tokens
 
 
+#: Session cookies of the human-facing services on this host: Mattermost (the human lead's session) and the
+#: Switch Gateway (the admin's). Browsers scope cookies by host, not by port, so a browser that visits the proxy
+#: on the same host name sends them along. They must never reach an upstream, which serves code the translator
+#: generated (docs/ISOLATION.md §1). Compared case-insensitively.
+CREDENTIAL_COOKIES: frozenset[bytes] = frozenset({b"mmauthtoken", b"mmuserid", b"mmcsrf", b"switch_auth"})
+
+
+def _strip_credential_cookies(value: bytes) -> bytes:
+    """A ``Cookie`` header value without :data:`CREDENTIAL_COOKIES`; the other pairs keep their bytes and order."""
+    kept = [pair for pair in value.split(b";")
+            if pair.strip() and pair.split(b"=", 1)[0].strip().lower() not in CREDENTIAL_COOKIES]
+    return b";".join(kept).strip()
+
+
 def _forward_request_headers(raw_headers: Sequence[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
-    """Strip hop-by-hop and host headers from an incoming request, keeping the raw value bytes
-    (a valid latin-1 byte such as 0xE9 must not turn into an ASCII encoding error)."""
+    """Strip hop-by-hop and host headers, and the credential cookies of :data:`CREDENTIAL_COOKIES`, from an
+    incoming request, keeping the raw value bytes (a valid latin-1 byte such as 0xE9 must not turn into an
+    ASCII encoding error). A ``Cookie`` header left empty is dropped."""
     decoded = [(name.decode("latin-1").lower(), value.decode("latin-1")) for name, value in raw_headers]
     excluded = set(REQUEST_EXCLUDED_HEADERS) | _connection_tokens(decoded)
-    return [(name.lower(), value) for name, value in raw_headers
-            if name.decode("latin-1").lower() not in excluded]
+    forwarded: list[tuple[bytes, bytes]] = []
+    for name, value in raw_headers:
+        lname = name.decode("latin-1").lower()
+        if lname in excluded:
+            continue
+        if lname == "cookie":
+            value = _strip_credential_cookies(value)
+            if not value:
+                continue
+        forwarded.append((name.lower(), value))
+    return forwarded
 
 
 def _forward_response_headers(headers: Iterable[tuple[str, str]]) -> list[tuple[bytes, bytes]]:

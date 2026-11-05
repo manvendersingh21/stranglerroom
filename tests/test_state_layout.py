@@ -332,3 +332,20 @@ def test_importing_the_proxy_touches_no_state(tmp_path):
     subprocess.run([sys.executable, "-c", "import targets.proxy.router as r; assert r.app is r.get_app()"],
                    env=env, cwd=ROOT, check=True, timeout=60)
     assert (state / "proxy").is_dir() and (state / "router.token").is_file()
+
+
+def test_room_json_is_published_0644_atomically_under_any_umask(tmp_path, monkeypatch):
+    """Every agent reads room.json and, when isolated, each agent is another OS user: the operator's provisioning
+    must publish it world-readable (it holds no secret) whatever its umask, and leave no temporary file."""
+    import agents.provision as pv
+
+    monkeypatch.setattr(pv, "STATE_DIR", tmp_path)
+    old = os.umask(0o077)
+    try:
+        pv.RoomInfo("room-1", "strangler-migration", "chan", "http://mm/x", {"translator": "a1"}, "user").save()
+    finally:
+        os.umask(old)
+    path = tmp_path / "room.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert pv.RoomInfo.load().room_id == "room-1"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["room.json"]
