@@ -169,7 +169,7 @@ codex, opencode, antigravity, cursor`) and `POST /agents/register-known-bulk` (`
 - Recover a lost key without rotation: owner only, `GET /gateway/api-keys` then `GET /gateway/api-keys/{key_id}/reveal` (`SC/gateway/api_keys.py:47-69,114-140`). Not possible for bootstrap-owned agents (that user never logs in).
 
 ```python
-import httpx, json, os, pathlib
+import httpx, json, os, pathlib, tempfile
 
 SWITCH = os.environ.get("SWITCH_URL", "http://localhost:18000")
 REG = os.environ["AGENT_REGISTRATION_TOKEN"]         # or an admin-minted registration key (3.5)
@@ -195,7 +195,9 @@ def creds(name: str, description: str) -> dict:
             return c
     c = register(name, description, overwrite=True)    # rotate (owner = same token owner)
     CRED_DIR.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(c)); p.chmod(0o600)
+    fd, tmp = tempfile.mkstemp(dir=CRED_DIR)           # 0600 from creation: no readable window
+    with os.fdopen(fd, "w") as f: json.dump(c, f)
+    os.replace(tmp, p)
     return c
 ```
 

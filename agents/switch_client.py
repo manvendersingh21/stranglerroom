@@ -28,6 +28,7 @@ import logging
 import os
 import queue
 import socket
+import tempfile
 import threading
 import time
 import uuid
@@ -43,6 +44,7 @@ log = logging.getLogger("strangler.switch")
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = Path(os.environ.get("STRANGLER_STATE_DIR", str(ROOT / ".state")))
 
+DEFAULT_SWITCH_URL = "http://localhost:18000"
 HEARTBEAT_INTERVAL_S = 2.0
 STREAM_READ_TIMEOUT_S = 45.0  # server keepalives arrive every 15 s of idle
 
@@ -139,7 +141,7 @@ class Settings:
             return value
 
         return cls(
-            switch_url=get("SWITCH_URL", "http://localhost:18000").rstrip("/"),
+            switch_url=get("SWITCH_URL", DEFAULT_SWITCH_URL).rstrip("/"),
             registration_token=get("AGENT_REGISTRATION_TOKEN"),
             admin_email=get("GATEWAY_ADMIN_EMAIL"),
             admin_password=get("GATEWAY_ADMIN_PASSWORD"),
@@ -148,6 +150,24 @@ class Settings:
             mattermost_user=get("MATTERMOST_USER", "user"),
             mattermost_user_password=get("MATTERMOST_USER_PASSWORD"),
         )
+
+    @classmethod
+    def load_agent(cls) -> "Settings":
+        """Settings for a room agent, which needs only ``SWITCH_URL`` (it authenticates with its own API key).
+
+        ``SWITCH_URL`` comes from the environment, else from ``switch.env`` if this process may read it, else
+        :data:`DEFAULT_SWITCH_URL`. The registration token, gateway admin credentials and Mattermost password are
+        never loaded (they stay empty strings): an isolated agent cannot read ``switch.env`` at all
+        (``PermissionError`` is tolerated; any other error propagates)."""
+        url = (os.environ.get("SWITCH_URL") or "").strip()
+        if not url:
+            try:
+                url = read_env_file(STATE_DIR / "switch.env").get("SWITCH_URL", "").strip()
+            except PermissionError:
+                log.debug("switch.env is not readable by this user; using the default SWITCH_URL")
+        return cls(switch_url=(url or DEFAULT_SWITCH_URL).rstrip("/"), registration_token="", admin_email="",
+                   admin_password="", mattermost_url="", mattermost_team="", mattermost_user="",
+                   mattermost_user_password="")
 
 
 # ------------------------------------------------------------------------------------ credentials
@@ -163,12 +183,21 @@ class AgentCredentials:
         return STATE_DIR / "agents" / f"{name}.json"
 
     def save(self) -> None:
+        """Write the key file atomically. The temporary file comes from ``mkstemp`` in the same directory, so it
+        is 0600 from creation (the key is never in a file others can read) and has an unpredictable name; it is
+        removed if anything fails before the rename."""
         path = self.path_for(self.name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"name": self.name, "agent_id": self.agent_id, "api_key": self.api_key}))
-        tmp.chmod(0o600)
-        tmp.replace(path)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"name": self.name, "agent_id": self.agent_id, "api_key": self.api_key}, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     @classmethod
     def load(cls, name: str) -> "AgentCredentials | None":

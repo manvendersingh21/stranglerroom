@@ -59,11 +59,19 @@ __all__ = [
     "run_campaign",
     "TAG_TITLES",
     "QUIRK_TAGS",
+    "default_registry_path",
     "main",
 ]
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REGISTRY_PATH = ROOT / ".state" / "divergence_registry.json"
+
+
+def default_registry_path() -> Path:
+    """``<STRANGLER_STATE_DIR or <repo>/.state>/fuzzer/divergence_registry.json``, resolved at call time
+    (the fuzzer's private state directory, see docs/ISOLATION.md section 2)."""
+    state_dir = (os.environ.get("STRANGLER_STATE_DIR") or "").strip() or str(ROOT / ".state")
+    return Path(state_dir).expanduser() / "fuzzer" / "divergence_registry.json"
+
 
 #: Maximum number of human-readable lines :func:`compare` returns.
 MAX_DIFF_LINES = 8
@@ -437,7 +445,7 @@ def tag_title(tag: str) -> str:
 class Registry:
     """Persistent ``tag -> cluster`` mapping with first-come ``D-n`` numbering.
 
-    File format (``$ROOT/.state/divergence_registry.json``)::
+    File format (default path :func:`default_registry_path`, ``.state/fuzzer/divergence_registry.json``)::
 
         {"json_suffix": {"id": "D-1", "modern_status_at_discovery": 404,
                          "legacy_status_at_discovery": 200, "sample": {...probe...},
@@ -447,8 +455,8 @@ class Registry:
     reset from a test) never see stale numbering; writes are atomic.
     """
 
-    def __init__(self, path: Path | str = DEFAULT_REGISTRY_PATH) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Path | str | None = None) -> None:
+        self.path = Path(path) if path is not None else default_registry_path()
         self._lock = threading.Lock()
 
     # -- persistence ---------------------------------------------------------------
@@ -1034,7 +1042,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--decisions", help='JSON like {"D-1": {"decision": "preserve"}} or @file.json')
     ap.add_argument("--n-random", type=int, default=120)
     ap.add_argument("--seed", type=int, default=1337)
-    ap.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY_PATH)
+    ap.add_argument("--registry", type=Path, default=None,
+                    help="divergence registry file (default: <STRANGLER_STATE_DIR>/fuzzer/divergence_registry.json)")
     ap.add_argument("--json", action="store_true", help="print the report as JSON instead of Markdown")
     args = ap.parse_args(argv)
 

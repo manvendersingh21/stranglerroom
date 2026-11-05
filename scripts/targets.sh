@@ -3,7 +3,8 @@
 #   :9001 legacy web.py Open Library, :9002 modern FastAPI (hot reload), :9000 strangler proxy
 #
 #   scripts/targets.sh start [--fresh]   # --fresh: stop ours, require free ports, remove generated modern lists.py,
-#                                        #          reset the proxy to legacy and the divergence registry
+#                                        #          reset the proxy to legacy (.state/proxy/router.json) and the
+#                                        #          divergence registry (.state/fuzzer/divergence_registry.json)
 #   scripts/targets.sh stop | status
 #
 # PIDs/logs live in .state/run/<name>.{pid,log}. Only a pid read from our own pid file is ever signalled, and only
@@ -110,7 +111,7 @@ case "${1:-start}" in
     if [ "${2:-}" = "--fresh" ]; then
       stop
       ports_free 9000 9001 9002
-      rm -f "$ROOT/targets/modern_fastapi/app/lists.py" "$ROOT/.state/router.json" "$ROOT/.state/divergence_registry.json"
+      rm -f "$ROOT/targets/modern_fastapi/app/lists.py" "$ROOT/.state/proxy/router.json" "$ROOT/.state/fuzzer/divergence_registry.json"
     fi
     echo "starting targets"
     svc legacy targets.legacy_openlibrary.server 9001 /health

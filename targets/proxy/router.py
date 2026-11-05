@@ -6,8 +6,9 @@ Run with::
 
 The router forwards every non-admin request to either the legacy web.py
 service or the modern FastAPI service.  The selected target is held in memory
-and persisted to an atomically replaced JSON state file, so a restart keeps the
-last cutover decision.
+and persisted to an atomically replaced JSON state file (``ROUTER_STATE_FILE``, default
+``<STRANGLER_STATE_DIR or .state>/proxy/router.json``), so a restart keeps the last cutover
+decision.
 
 Admin endpoints (never forwarded)::
 
@@ -44,7 +45,15 @@ DEFAULT_PORT = 9000
 DEFAULT_HOST = "127.0.0.1"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_STATE_FILE = REPO_ROOT / ".state" / "router.json"
+
+
+def default_state_file(env: Mapping[str, str] | None = None) -> Path:
+    """The routing state file when ``ROUTER_STATE_FILE`` is unset:
+    ``<STRANGLER_STATE_DIR or <repo>/.state>/proxy/router.json`` (the proxy's private state directory)."""
+    values = os.environ if env is None else env
+    state_dir = (values.get("STRANGLER_STATE_DIR") or "").strip() or str(REPO_ROOT / ".state")
+    return Path(state_dir).expanduser() / "proxy" / "router.json"
+
 
 UPSTREAM_TIMEOUT = httpx.Timeout(30.0)
 
@@ -142,7 +151,7 @@ class RouterConfig:
         values = os.environ if env is None else env
         legacy_url = (values.get("LEGACY_URL") or DEFAULT_LEGACY_URL).rstrip("/")
         modern_url = (values.get("MODERN_URL") or DEFAULT_MODERN_URL).rstrip("/")
-        state_file = Path(values.get("ROUTER_STATE_FILE") or DEFAULT_STATE_FILE).expanduser()
+        state_file = Path(values.get("ROUTER_STATE_FILE") or default_state_file(values)).expanduser()
         # No public default secret, and the SAME rule as @cutover-gate (targets/common/router_token.py).
         admin_token = resolve_router_token(values)
         return cls(
@@ -513,7 +522,24 @@ class StranglerRouter:
         )
 
 
-app = StranglerRouter()
+_app: StranglerRouter | None = None
+
+
+def get_app() -> StranglerRouter:
+    """The process-wide router, built on first use rather than at import: building it reads the environment,
+    creates the state directory and may generate the router token, so merely importing this module (tests,
+    tools) must not touch ``.state``."""
+    global _app
+    if _app is None:
+        _app = StranglerRouter()
+    return _app
+
+
+def __getattr__(name: str) -> Any:
+    """Module attribute ``app`` (``uvicorn targets.proxy.router:app``), built lazily by :func:`get_app`."""
+    if name == "app":
+        return get_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -536,7 +562,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(get_app(), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
