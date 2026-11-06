@@ -1,0 +1,24 @@
+{
+  "task_id": "isolation-impl-review",
+  "session": "s-isolation-impl-review-2a086c",
+  "ledger": ".hacp/sessions/s-isolation-impl-review-2a086c.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-isolation-impl-review-2a086c",
+  "revision": "39233a70a4d68b8be47b3a3f32484b1274b1e5c47e08d053687ad5b1e0333100",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/isolation-impl.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/isolation-impl.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/isolation-impl.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

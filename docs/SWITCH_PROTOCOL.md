@@ -33,7 +33,7 @@ zero rooms, cookie issued **without** `Secure` (`GATEWAY_COOKIE_SECURE=false`).
 There is no separate gateway port natively. The docker-compose stack's `:3000` gateway UI and its
 default `:8000` API do not apply here. **[resolved]** The gateway report's `BASE=http://localhost:8080`
 and the ops report's "gateway on 3000" are both wrong for this stack: every gateway route is
-`{SWITCH_URL}/gateway/...` with `SWITCH_URL=http://localhost:18000`.
+`{SWITCH_URL}/gateway/...` with `SWITCH_URL=http://127.0.0.1:18000`.
 
 ### 1.2 Boot
 
@@ -59,7 +59,7 @@ cd /root/another_hackathon/.switch-infra/core && nohup .venv/bin/python -m switc
 ```
 
 Then the seeder: `MATTERMOST_URL=MATTERMOST_URL_FOR_SWITCH=http://localhost:18065`,
-`MATTERMOST_CALLBACK_BASE_URL=http://127.0.0.1:18081`, `SWITCH_URL=http://localhost:18000`,
+`MATTERMOST_CALLBACK_BASE_URL=http://127.0.0.1:18081`, `SWITCH_URL=http://127.0.0.1:18000`,
 `core/.venv/bin/python deploy/shared_resources/setup.py` (retried up to 5 times).
 
 ### 1.3 Required env (no defaults; all missing = 10 validation errors)
@@ -169,9 +169,9 @@ codex, opencode, antigravity, cursor`) and `POST /agents/register-known-bulk` (`
 - Recover a lost key without rotation: owner only, `GET /gateway/api-keys` then `GET /gateway/api-keys/{key_id}/reveal` (`SC/gateway/api_keys.py:47-69,114-140`). Not possible for bootstrap-owned agents (that user never logs in).
 
 ```python
-import httpx, json, os, pathlib
+import httpx, json, os, pathlib, tempfile
 
-SWITCH = os.environ.get("SWITCH_URL", "http://localhost:18000")
+SWITCH = os.environ.get("SWITCH_URL", "http://127.0.0.1:18000")
 REG = os.environ["AGENT_REGISTRATION_TOKEN"]         # or an admin-minted registration key (3.5)
 CRED_DIR = pathlib.Path("/root/another_hackathon/.state/agents")
 
@@ -195,7 +195,9 @@ def creds(name: str, description: str) -> dict:
             return c
     c = register(name, description, overwrite=True)    # rotate (owner = same token owner)
     CRED_DIR.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(c)); p.chmod(0o600)
+    fd, tmp = tempfile.mkstemp(dir=CRED_DIR)           # 0600 from creation: no readable window
+    with os.fdopen(fd, "w") as f: json.dump(c, f)
+    os.replace(tmp, p)
     return c
 ```
 
@@ -287,7 +289,7 @@ Fix, pick one:
 ```python
 import httpx, os
 
-SWITCH = os.environ.get("SWITCH_URL", "http://localhost:18000")
+SWITCH = os.environ.get("SWITCH_URL", "http://127.0.0.1:18000")
 
 def gateway() -> httpx.Client:
     c = httpx.Client(base_url=SWITCH, timeout=30)
@@ -425,7 +427,7 @@ Recommended listener: one connection `scope=all&filter=addressed`, beating.
 ```python
 import asyncio, json, os, uuid, httpx
 
-SWITCH = os.environ.get("SWITCH_URL", "http://localhost:18000")
+SWITCH = os.environ.get("SWITCH_URL", "http://127.0.0.1:18000")
 
 class Listener:
     def __init__(self, agent_id, api_key, on_event, scope="all", filt="addressed", rooms=()):
@@ -603,7 +605,7 @@ Response: `{"id": "<room id>", "name", "transport_room_id", "matrix_room_id", "f
 ```python
 import httpx, os
 
-SWITCH = os.environ.get("SWITCH_URL", "http://localhost:18000")
+SWITCH = os.environ.get("SWITCH_URL", "http://127.0.0.1:18000")
 
 def op(agent: dict, name: str, args: dict | None = None, conn_id: str | None = None):
     h = {"Authorization": f"Bearer {agent['api_key']}"}
@@ -670,7 +672,7 @@ print(op(translator, "read_context", {"limit": 20, "room_id": room_id}))
 import os, time, httpx
 
 MM = os.environ.get("MATTERMOST_URL", "http://localhost:18065")
-SWITCH = os.environ.get("SWITCH_URL", "http://localhost:18000")
+SWITCH = os.environ.get("SWITCH_URL", "http://127.0.0.1:18000")
 
 def mm_login(user=os.environ.get("MATTERMOST_USER", "user"),
              pw=os.environ["MATTERMOST_USER_PASSWORD"]) -> httpx.Client:

@@ -3,7 +3,8 @@
 Actions cannot run here, so the workflow is verified structurally with ``yaml.safe_load``:
 
 * triggers: push (main/master only, PRs run via pull_request) + pull_request; least-privilege token; one concurrency group per ref with cancel-in-progress;
-* job ``unit``: checkout, setup-python 3.12, setup-uv, ``make install`` then ``make test``;
+* job ``unit``: checkout, setup-python 3.12, setup-uv, ``make install`` then ``make test``, then the isolation tests as
+  root (``sudo -E .venv/bin/python -m pytest … tests/test_isolation.py``: the launcher's root-only paths);
 * job ``e2e`` (needs ``unit``, timeout 45 min): the docker-mode Switch bootstrap, ``make install``, ``make e2e`` in that
   order (``make e2e`` runs the driver with ``--fresh`` which provisions agents + room itself), and a
   ``failure() || cancelled()`` artifact upload (a job timeout reports as cancelled) carrying ``.state/run/*.log`` plus the ``docker compose logs`` output
@@ -126,6 +127,15 @@ def test_unit_job_runs_install_then_test(wf):
     i_test = index_of(st, lambda s: has_cmd(s, "make test"), "make test")
     assert i_install < i_test
     assert not any("bootstrap_switch" in run_text(s) for s in st), "unit job must not need Docker/Switch"
+
+
+def test_unit_job_also_runs_the_isolation_tests_as_root(wf):
+    """A non-root `make test` skips the launcher's root-only tests (privilege drop, chown); CI runs them with sudo."""
+    st = steps(wf, "unit")
+    i_test = index_of(st, lambda s: has_cmd(s, "make test"), "make test")
+    i_root = index_of(st, lambda s: "sudo -E .venv/bin/python -m pytest" in run_text(s)
+                      and "tests/test_isolation.py" in run_text(s), "isolation tests as root")
+    assert i_test < i_root
 
 
 def bootstrap_step(st):

@@ -1,0 +1,24 @@
+{
+  "task_id": "isolation-operator-reaudit-r3",
+  "session": "s-isolation-operator-reaudit-r3-4638d2",
+  "ledger": ".hacp/sessions/s-isolation-operator-reaudit-r3-4638d2.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-isolation-operator-reaudit-r3-4638d2",
+  "revision": "6781279339e22e21d8202b4bc95166d7c9b1fafeb9c396c0daf39c2cef248267",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/isolation-operator-reaudit.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/isolation-operator-reaudit.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/isolation-operator-reaudit.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

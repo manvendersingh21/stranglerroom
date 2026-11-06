@@ -1,0 +1,20 @@
+{
+ "task_id": "isolation-impact-audit-nemotron",
+ "peer": "opencode",
+ "model": "opencode/nemotron-3.5-super-vl-free",
+ "effort": "high",
+ "summary": "runtime dependency audit of each component against the isolation implementation",
+ "prompt": "Read docs/ISOLATION.md (each StranglerRoom component runs as its own Unix user from /srv/stranglerroom; agents/isolation.py implements it). Then, for each component - translator (agents/translator_agent.py and what it imports, incl. agents/llm_synth.py, agents/codegen/), fuzzer (agents/fuzzer_agent.py, agents/divergence.py), cutover-gate (agents/cutover_agent.py, agents/bench.py), proxy (targets/proxy/router.py), legacy (targets/legacy_openlibrary/), modern (targets/modern_fastapi/) - list EVERY file or directory it reads or writes at runtime, every environment variable it reads, every subprocess it starts and every network address it connects to, with file:line. Then compare with the environment schema in agents/isolation.py (COMPONENTS, child_env) and the service area layout: mark each item OK / BREAKS (the isolated component would lose something it needs: a path outside its private dir that it writes, an env var the schema drops, a host name the launcher refuses) / EXPOSED (a secret another component could read). Write .hacp/reviews/isolation-impact-audit.md with '## Inventory' (a table per component) and '## Problems' (each BREAKS/EXPOSED item with the minimal fix; 'None.' if none). Do not modify any other file.",
+ "outputs": [
+  ".hacp/reviews/isolation-impact-audit.md"
+ ],
+ "context": [
+  "docs/ISOLATION.md"
+ ],
+ "acceptance": [
+  "grep -q '## Inventory' .hacp/reviews/isolation-impact-audit.md",
+  "grep -q '## Problems' .hacp/reviews/isolation-impact-audit.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 2400
+}

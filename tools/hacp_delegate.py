@@ -58,7 +58,7 @@ HACP_DIR = ROOT / ".hacp"
 PROTOCOL = "HACP/2.0"
 REQUESTER = "urn:hacp:agent:claude-orchestrator"
 AGY_READONLY = ("ls", "cat", "grep", "head", "tail", "wc", "mkdir", "pwd", "find", "diff")
-EXCLUDE_TOP = {".venv", ".switch-infra", ".native", ".state", ".hacp", ".git", ".hypothesis",
+EXCLUDE_TOP = {".venv", ".switch-infra", ".native", ".state", ".hacp", ".git", ".hypothesis", ".claude",
                ".pytest_cache", "node_modules"}
 QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|exceeded your current quota|"
                       r"hit your usage limit|usage limit reached", re.I)
@@ -134,6 +134,9 @@ def make_workspace(session_id: str) -> Path:
             shutil.copy2(entry, dest)
     (ws / ".venv").symlink_to(ROOT / ".venv")
     (ws / ".state").mkdir()
+    # Its own (empty) git repository: peers that locate their project root via git (opencode) must stop here,
+    # not at the real checkout above .hacp/work/, or they would write into the real tree.
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
     return ws
 
 
@@ -215,6 +218,8 @@ def run_peer(c: dict, ws: Path, prompt: str, log: Path) -> int:
             allow = ["command(.venv/bin/pytest)", "command(.venv/bin/python)",
                      f"command({ws}/.venv/bin/pytest)", f"command({ws}/.venv/bin/python)"]
             allow += [f"command({x})" for x in AGY_READONLY]
+            # agy's own file tools need explicit rules in headless mode (they cannot prompt): read-only, workspace only
+            allow += [f"read_file({ws})"]  # agy's rule form: read_file(<absolute_path>), a directory covers its tree
             cmd = ["agy", "-p", prompt, "--mode", "accept-edits", "--settings",
                    json.dumps({"permissions": {"allow": allow}}), "--model", model]
             if model.startswith("gemini"):  # agy rejects --effort for models with a fixed thinking budget

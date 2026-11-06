@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# Per-component OS-user isolation needs root and `make isolate` (docs/ISOLATION.md); the runner is neither, so say
+# it explicitly instead of relying on the absent marker.
+env:
+  STRANGLER_ISOLATION: 'off'
+
 concurrency:
   group: '${{ github.workflow }}-${{ github.ref }}'
   cancel-in-progress: true
@@ -27,6 +32,18 @@ jobs:
           enable-cache: true
       - run: make install
       - run: make test
+      # The isolation launcher's privilege drop, chown and root-only paths are skipped by a non-root `make test`; run
+      # them as root on this clean runner (no sr-* users, no marker): they use temporary fixtures only.
+      - name: Isolation tests as root
+        timeout-minutes: 8
+        run: |
+          # The mirrored venv's interpreter must sit on a path only root can modify (docs/ISOLATION.md §2.2). On this
+          # throwaway runner the tool cache belongs to `runner` and /opt is group-writable: hand that chain to root.
+          sudo chown root:root /opt /opt/hostedtoolcache /opt/hostedtoolcache/Python "$(dirname "$pythonLocation")"
+          sudo chmod go-w /opt /opt/hostedtoolcache /opt/hostedtoolcache/Python "$(dirname "$pythonLocation")"
+          sudo chown -R root:root "$pythonLocation"
+          sudo chmod -R go-w "$pythonLocation"
+          sudo -E .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_isolation.py tests/test_state_layout.py
 
   e2e:
     needs: unit

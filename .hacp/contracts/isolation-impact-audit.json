@@ -1,0 +1,20 @@
+{
+ "task_id": "isolation-impact-audit",
+ "peer": "opencode",
+ "model": "opencode/big-pickle",
+ "effort": "high",
+ "summary": "audit every runtime file/env/IPC dependency of each component against the isolation design",
+ "prompt": "Read docs/ISOLATION.md (a design for running each StranglerRoom component as its own Unix user). Then audit the code under agents/ and targets/ (read whatever you need) and list, for each component \u2014 translator (agents/translator_agent.py and what it imports), fuzzer (agents/fuzzer_agent.py, agents/divergence.py), cutover-gate (agents/cutover_agent.py, agents/bench.py), proxy (targets/proxy/router.py), legacy (targets/legacy_openlibrary/), modern (targets/modern_fastapi/) \u2014 EVERY file or directory it reads or writes at runtime (with the code location), every environment variable it reads, and every subprocess it starts. Then mark each one OK / BREAKS / EXPOSED under the design: BREAKS = the component would lose access it needs (e.g. a path outside its private directory that it writes, a file another user creates with a restrictive mode, an env var the allow-list in section 4 drops), EXPOSED = something secret stays readable by another component. Be exhaustive and cite file:line. Write the result to .hacp/reviews/isolation-impact-audit.md with sections '## Inventory' (a table per component) and '## Problems' (each BREAKS/EXPOSED item with the minimal fix; 'None.' if none). Do not modify any other file.",
+ "outputs": [
+  ".hacp/reviews/isolation-impact-audit.md"
+ ],
+ "context": [
+  "docs/ISOLATION.md"
+ ],
+ "acceptance": [
+  "grep -q '## Inventory' .hacp/reviews/isolation-impact-audit.md",
+  "grep -q '## Problems' .hacp/reviews/isolation-impact-audit.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 1800
+}

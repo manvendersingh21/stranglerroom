@@ -22,7 +22,7 @@ mention-addressed; the grammar lives in :mod:`agents.commands`):
 Governance: a human-only command from a non-human sender (or ``record-cutover`` from anyone but the
 cutover gate) is refused with :data:`agents.commands.MARK` ``governance_refusal``, recorded in the
 ledger (``refusals`` + a trail entry while the ledger is open; persisted to
-``.state/translator_pending_refusals.json`` and carried into the next ledger if none exists yet), and
+``.state/translator/pending_refusals.json`` and carried into the next ledger if none exists yet), and
 changes nothing. While the cutover gate's scorecard shows an active cutover to modern, neither a new
 migration nor new decisions may rewrite the live module (roll back first). A failed deploy restores the
 previously served module. Re-delivered command events (same message id) are applied once.
@@ -67,12 +67,21 @@ from agents.switch_client import Event
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEGACY_MODULE = ROOT / "targets/legacy_openlibrary/openlibrary/plugins/openlibrary/lists.py"
 DEFAULT_MODERN_LISTS = ROOT / "targets/modern_fastapi/app/lists.py"
-DEFAULT_PENDING_REFUSALS = ROOT / ".state/translator_pending_refusals.json"
+#: Mode of the published module: the modern server runs as another OS user (docs/ISOLATION.md).
+MODULE_MODE = 0o644
 CUTOVER_GATE = "cutover-gate"
 FUZZER = "fuzzer"
 MODES = ("deterministic", "llm")
 SOURCE_SYSTEM, TARGET_SYSTEM = "legacy_openlibrary", "fastapi"
 DECISION_STATUSES_OPEN = ("scaffolded", "awaiting-decision", "patching", "parity-approved")
+
+
+def default_pending_refusals_path() -> Path:
+    """``<STRANGLER_STATE_DIR or <repo>/.state>/translator/pending_refusals.json``, resolved at call time
+    (the translator's private state directory)."""
+    state_dir = (os.environ.get("STRANGLER_STATE_DIR") or "").strip() or str(ROOT / ".state")
+    return Path(state_dir).expanduser() / "translator" / "pending_refusals.json"
+
 
 #: one line per (tag, decision) for the "🔧 Applied human decisions" message.
 EXPLAIN = {
@@ -205,7 +214,7 @@ class TranslatorAgent(RoomAgent):
         #: refusals seen while no ledger existed; persisted to ``pending_refusals_path`` (survives restarts)
         #: and carried into the next migration's ledger.
         self.pending_refusals_path = Path(pending_refusals_path or os.environ.get("STRANGLER_TRANSLATOR_PENDING")
-                                          or DEFAULT_PENDING_REFUSALS)
+                                          or default_pending_refusals_path())
         self.pending_refusals: list[dict] = self._read_pending()
 
     @property
@@ -392,6 +401,9 @@ class TranslatorAgent(RoomAgent):
             with os.fdopen(fd, "wb") as fh:
                 fh.write(source.encode("utf-8") if isinstance(source, str) else source)
                 fh.flush()
+                # mkstemp creates 0600 and the umask may be 077: the modern server (another OS user when
+                # isolated) must be able to read the published module.
+                os.fchmod(fh.fileno(), MODULE_MODE)
                 os.fsync(fh.fileno())
             os.replace(tmp, target)
         except BaseException:

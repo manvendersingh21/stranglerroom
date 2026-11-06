@@ -21,7 +21,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFRA="$ROOT/.switch-infra"
 NATIVE="$ROOT/.native"
-STATE="$ROOT/.state"
+STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"  # the same state directory the Python side resolves
 SWITCH_TAG="switch-v0.31.0"
 SWITCH_VERSION="0.31.0"
 MM_VERSION="11.9.0"
@@ -59,22 +59,31 @@ gen_secrets() { # env-file label
   # switch-v0.31.0 predates that script; this is the same key list as its `just init-env` recipe
   # (and as the later upstream script), generated locally so CI never depends on upstream `main`.
   command -v openssl >/dev/null 2>&1 || die "openssl is required to generate secrets"
-  for key in DB_PASSWORD DB_OWNER_PASSWORD AGENT_REGISTRATION_TOKEN GATEWAY_ADMIN_PASSWORD \
-             MATTERMOST_ADMIN_PASSWORD MATTERMOST_USER_PASSWORD; do
-    grep -q "^${key}=" "$file" || die "$file has no ${key}= line to fill"
-    sed -i "s|^${key}=.*|${key}=$(openssl rand -hex 24)|" "$file"
-  done
-  grep -q "^SECRET_KEYS=" "$file" || die "$file has no SECRET_KEYS= line to fill"
-  sed -i "s|^SECRET_KEYS=.*|SECRET_KEYS=${label}:$(openssl rand -hex 32)|" "$file"
+  local keys=(DB_PASSWORD DB_OWNER_PASSWORD AGENT_REGISTRATION_TOKEN GATEWAY_ADMIN_PASSWORD
+              MATTERMOST_ADMIN_PASSWORD MATTERMOST_USER_PASSWORD SECRET_KEYS) line tmp
+  for key in "${keys[@]}"; do grep -q "^${key}=" "$file" || die "$file has no ${key}= line to fill"; done
+  # Rewrite the file line by line: a generated value only ever travels through a pipe and builtins, never through
+  # a command line (/proc/<pid>/cmdline is world-readable), and the new file is 0600 from creation (mktemp).
+  tmp="$(mktemp "$file.XXXXXX")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "${line%%=*}" in
+      SECRET_KEYS) printf 'SECRET_KEYS=%s:%s\n' "$label" "$(openssl rand -hex 32)" ;;
+      DB_PASSWORD|DB_OWNER_PASSWORD|AGENT_REGISTRATION_TOKEN|GATEWAY_ADMIN_PASSWORD|MATTERMOST_ADMIN_PASSWORD|MATTERMOST_USER_PASSWORD)
+        printf '%s=%s\n' "${line%%=*}" "$(openssl rand -hex 24)" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done <"$file" >"$tmp"
+  mv -f "$tmp" "$file"
 }
 
 prepare_env() { # mode
   local mode="$1"
   if [ ! -f "$INFRA/.env" ]; then
-    cp "$INFRA/.env.example" "$INFRA/.env"
-    gen_secrets "$INFRA/.env" local
+    (umask 077; cp "$INFRA/.env.example" "$INFRA/.env")  # 0600 before any secret is written into it
+    gen_secrets "$INFRA/.env" local                     # sed -i keeps the file's mode
     log "generated .env with fresh secrets"
   fi
+  chmod 600 "$INFRA/.env"  # also tightens a .env from an older bootstrap: it holds the DB and admin secrets
   sed -i "s|^SWITCH_VERSION=.*|SWITCH_VERSION=${SWITCH_VERSION}|" "$INFRA/.env"
   sed -i "s|^MATTERMOST_HOST_PORT=.*|MATTERMOST_HOST_PORT=${MM_PORT}|" "$INFRA/.env"
   if [ "$mode" = docker ]; then
@@ -89,8 +98,10 @@ prepare_env() { # mode
 
 write_state_env() {
   set -a; . "$INFRA/.env"; set +a
+  mkdir -p "$STATE"
+  touch "$STATE/switch.env" && chmod 600 "$STATE/switch.env"  # 0600 before the secrets are written
   cat >"$STATE/switch.env" <<EOF
-SWITCH_URL=http://localhost:${API_PORT}
+SWITCH_URL=http://127.0.0.1:${API_PORT}
 MATTERMOST_URL=http://localhost:${MM_PORT}
 AGENT_REGISTRATION_TOKEN=${AGENT_REGISTRATION_TOKEN}
 GATEWAY_ADMIN_EMAIL=${GATEWAY_ADMIN_EMAIL}
@@ -102,7 +113,11 @@ MATTERMOST_ADMIN_USER=${MATTERMOST_ADMIN_USER}
 MATTERMOST_ADMIN_PASSWORD=${MATTERMOST_ADMIN_PASSWORD}
 EOF
   chmod 600 "$STATE/switch.env"
-  log "wrote .state/switch.env"
+  # The public part (no secret): all an agent process needs. Agents read this file, never switch.env.
+  printf 'SWITCH_URL=http://127.0.0.1:%s\nMATTERMOST_URL=http://localhost:%s\n' "$API_PORT" "$MM_PORT" \
+    >"$STATE/connection.env"
+  chmod 644 "$STATE/connection.env"
+  log "wrote .state/switch.env and .state/connection.env"
 }
 
 # ---------------------------------------------------------------- docker mode
@@ -112,7 +127,7 @@ docker_up() {
   prepare_env docker
   (cd "$INFRA" && docker compose -f deploy/local/standalone-docker-compose.yml --project-directory . \
       --profile collab --profile gateway up -d)
-  wait_http "http://localhost:${API_PORT}/health" switch-core 240
+  wait_http "http://127.0.0.1:${API_PORT}/health" switch-core 240
   wait_http "http://localhost:${MM_PORT}/api/v4/system/ping" mattermost 240
   log "waiting for the setup container to exit 0"
   local cid="" status="" code="" i=0
@@ -165,9 +180,14 @@ native_postgres() {
   if [ ! -f "$PGDATA_DIR/PG_VERSION" ]; then
     log "initdb $PGDATA_DIR"
     mkdir -p "$PGDATA_DIR"; chown -R postgres:postgres "$(dirname "$PGDATA_DIR")"
-    local pw; pw="$(dirname "$PGDATA_DIR")/.pw"; echo "$DB_OWNER_PASSWORD" >"$pw"; chown postgres "$pw"
-    su postgres -c "$PGB/initdb -D $PGDATA_DIR -U $DB_OWNER_USER --pwfile=$pw -A scram-sha-256 >/dev/null"
-    rm -f "$pw"
+    # The owner password goes to initdb in a file that is 0600 and owned by postgres from the start, inside a
+    # root-created private directory (0711: postgres can reach its file, nobody can list or replace anything).
+    local pwdir pw; pwdir="$(mktemp -d)"; pw="$pwdir/pw"
+    (umask 077; printf '%s\n' "$DB_OWNER_PASSWORD" >"$pw"); chown postgres "$pw"; chmod 0711 "$pwdir"
+    if ! su postgres -c "$PGB/initdb -D $PGDATA_DIR -U $DB_OWNER_USER --pwfile=$pw -A scram-sha-256 >/dev/null"; then
+      rm -rf "$pwdir"; die "initdb failed"
+    fi
+    rm -rf "$pwdir"
   fi
   if ! su postgres -c "$PGB/pg_ctl -D $PGDATA_DIR status" >/dev/null 2>&1; then
     su postgres -c "$PGB/pg_ctl -D $PGDATA_DIR -l $(dirname "$PGDATA_DIR")/pg.log -o '-p ${POSTGRES_HOST_PORT:-5432} -c listen_addresses=127.0.0.1 -c max_connections=300 -k /tmp' -w start" >/dev/null
@@ -176,9 +196,12 @@ native_postgres() {
   local q="psql -h 127.0.0.1 -p ${POSTGRES_HOST_PORT:-5432} -U $DB_OWNER_USER -d postgres -tAc"
   [ "$($q "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'")" = 1 ] || $q "CREATE DATABASE $DB_NAME" >/dev/null
   [ "$($q "SELECT 1 FROM pg_database WHERE datname='mattermost'")" = 1 ] || $q "CREATE DATABASE mattermost" >/dev/null
+  # Statements carrying a password go to psql on stdin (printf is a builtin), never in its argv.
+  local sql="psql -h 127.0.0.1 -p ${POSTGRES_HOST_PORT:-5432} -U $DB_OWNER_USER -d postgres -qtA -v ON_ERROR_STOP=1 -f -"
   [ "$($q "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'")" = 1 ] || \
-    $q "CREATE ROLE \"$DB_USER\" LOGIN PASSWORD '$DB_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS" >/dev/null
-  $q "ALTER ROLE \"$DB_USER\" PASSWORD '$DB_PASSWORD'" >/dev/null
+    printf "CREATE ROLE \"%s\" LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;\n" \
+      "$DB_USER" "$DB_PASSWORD" | $sql >/dev/null
+  printf "ALTER ROLE \"%s\" PASSWORD '%s';\n" "$DB_USER" "$DB_PASSWORD" | $sql >/dev/null
   log "postgres ready"
 }
 
@@ -209,26 +232,26 @@ native_mattermost() {
 }
 
 native_switch_core() {
-  if curl -fsS "http://localhost:${API_PORT}/health" 2>/dev/null | grep -q '"ok"'; then log "switch-core already running"; return; fi
+  if curl -fsS "http://127.0.0.1:${API_PORT}/health" 2>/dev/null | grep -q '"ok"'; then log "switch-core already running"; return; fi
   (
     set -a; . "$INFRA/.env"; set +a
     export DB_HOST=127.0.0.1 DB_PORT="${POSTGRES_HOST_PORT:-5432}" ID_SERVER_NAME=localhost MATRIX_SERVER_NAME=localhost
     export SERVER_HOST=127.0.0.1 SERVER_PORT="$API_PORT" COLLABORATION_CALLBACK_HOST=127.0.0.1 COLLABORATION_CALLBACK_PORT="${CALLBACK_PORT:-18081}"
     export GATEWAY_COOKIE_SECURE=false OUTBOUND_ALLOWED_PRIVATE_HOSTS=localhost,127.0.0.1
-    export GATEWAY_UI_DIR="$INFRA/gateway/dist" FRONTEND_BASE_URL="http://localhost:${API_PORT}"
+    export GATEWAY_UI_DIR="$INFRA/gateway/dist" FRONTEND_BASE_URL="http://127.0.0.1:${API_PORT}"
     export TELEMETRY_ENABLED=false THIRD_PARTY_AVATARS_ENABLED=false
     unset SWITCH_REGISTRY SWITCH_IMAGE_NAMESPACE GATEWAY_HOST_PORT API_HOST_PORT MATTERMOST_HOST_PORT POSTGRES_HOST_PORT SWITCH_BIND_ADDR FEATURE_FLAGS_ENABLED JWT_SECRET_KEY CONTROLLER_TOKEN_SECRET
     cd "$INFRA/core" || exit 1
     exec nohup .venv/bin/python -m switch_core.main >"$NATIVE/core.out" 2>&1 </dev/null &
     echo $! >"$NATIVE/switch-core.pid"
   )
-  wait_http "http://localhost:${API_PORT}/health" switch-core 180
+  wait_http "http://127.0.0.1:${API_PORT}/health" switch-core 180
 }
 
 native_setup() {
   (
     set -a; . "$INFRA/.env"; set +a
-    export SWITCH_URL="http://localhost:${API_PORT}" MATTERMOST_URL="http://localhost:${MM_PORT}"
+    export SWITCH_URL="http://127.0.0.1:${API_PORT}" MATTERMOST_URL="http://localhost:${MM_PORT}"
     export MATTERMOST_URL_FOR_SWITCH="http://localhost:${MM_PORT}" MATTERMOST_CALLBACK_BASE_URL="http://127.0.0.1:${CALLBACK_PORT:-18081}"
     local i=0
     until "$INFRA/core/.venv/bin/python" "$INFRA/deploy/shared_resources/setup.py" >"$NATIVE/setup.out" 2>&1; do

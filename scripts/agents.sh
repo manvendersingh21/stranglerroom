@@ -5,14 +5,34 @@
 #
 # Each agent runs as `$PYTHON -m <prefix><module>` in the background, with
 # PYTHONPATH set to the repository root and its PID/log files stored under
-# $STRANGLER_RUN_DIR (default: $ROOT/.state/run).  Only PIDs read from our own
+# $STRANGLER_RUN_DIR (default: $STATE/run, the directory targets.sh uses; STATE
+# is ${STRANGLER_STATE_DIR:-$ROOT/.state}).  Only PIDs read from our own
 # PID files are ever signalled, and only after verifying both that the process
 # is alive and that its /proc/<pid>/cmdline still names the expected module.
+#
+# Isolation (docs/ISOLATION.md §4): `python -m agents.isolation mode` decides
+# once whether each agent runs as its own OS user. When it is on, `mode
+# --run-dir` has already checked (creating it if need be) $RUN as a root-owned
+# 0700 directory on a path no service can modify, before this script touches
+# any file in it; each agent is launched through `agents.isolation exec`, which
+# execs into the agent (the recorded pid stays the agent's), and an agent only
+# counts as running once it runs as its sr-<name> user.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
-RUN="${STRANGLER_RUN_DIR:-$ROOT/.state/run}"
+STATE="${STRANGLER_STATE_DIR:-$ROOT/.state}"
+case "$STATE" in  # as the Python side reads it: ~ expanded, relative to the checkout; ~name/… refused by both
+  "~") STATE="$HOME" ;;
+  "~/"*) STATE="$HOME/${STATE#"~/"}" ;;
+  "~"*) echo "error: STRANGLER_STATE_DIR='$STATE': ~user paths are not supported; use an absolute path, ~/ or a" \
+             "path relative to the checkout" >&2; exit 2 ;;
+esac
+case "$STATE" in
+  /*) ;;
+  *) STATE="$ROOT/$STATE" ;;
+esac
+RUN="${STRANGLER_RUN_DIR:-$STATE/run}"
 PREFIX="${AGENTS_MODULE_PREFIX:-agents.}"
 
 # Keep paths independent of the caller's current working directory.
@@ -20,6 +40,26 @@ case "$RUN" in
   /*) ;;
   *) RUN="$ROOT/$RUN" ;;
 esac
+
+ISOLATE=""
+MODE_UNKNOWN=""
+if ! mode="$(cd "$ROOT" && PYTHONPATH="$ROOT" "$PYTHON" -m agents.isolation mode --run-dir "$RUN")"; then
+  mode=unknown
+fi
+case "$mode" in
+  on) ISOLATE=1 ;;
+  off) ;;
+  *)
+    case "${1:-}" in
+      stop|status)  # never leave agents running because the mode is unknown (e.g. a broken interpreter)
+        MODE_UNKNOWN=1
+        echo "warning: cannot determine the isolation mode; ${1} reads no pid file from the unvalidated run" \
+             "directory and acts on the agent service accounts' processes only" >&2 ;;
+      *) echo "error: cannot determine the isolation mode (see above); refusing to start" >&2; exit 2 ;;
+    esac ;;
+esac
+# Isolated: pid files and logs are root's alone (an agent could otherwise reopen its log via /proc/self/fd/1).
+if [ -n "$ISOLATE" ]; then umask 077; fi
 
 AGENT_NAMES=(translator fuzzer cutover-gate)
 
@@ -63,6 +103,40 @@ is_agent_pid() {
   return 1
 }
 
+# Isolated only: true if <pid> has finished the isolated exec. All four of its
+# uids are sr-<name>'s, and it no longer runs the root launcher, whose argv
+# (`-m agents.isolation exec <name> -- … -m <module>`) would satisfy
+# is_agent_pid() too.
+isolated_pid() { # pid name
+  local pid="$1" want uids args=() i
+  want="$(id -u "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$2" 2>/dev/null)" || return 1
+  uids="$(awk '/^Uid:/ {print $2, $3, $4, $5}' "/proc/$pid/status" 2>/dev/null)" || return 1
+  [ "$uids" = "$want $want $want $want" ] || return 1
+  mapfile -d '' -t args 2>/dev/null <"/proc/$pid/cmdline" || return 1
+  for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+    if [ "${args[i]}" = "-m" ] && [ "${args[i+1]}" = "agents.isolation" ]; then return 1; fi
+  done
+}
+
+# Kill every process of service user <user> (e.g. a daemon a compromised agent
+# forked), repeating until none is left (at most 50 rounds, each waiting for the
+# exits); after a final inventory, fail (non-zero) naming survivors.
+# The service users are ${STRANGLER_SERVICE_USER_PREFIX:-sr-}<name>; the variable is a test seam (tests set a prefix
+# that names no real user, so not even an unstubbed pkill can reach a live deployment).
+kill_service_user() { # user
+  local _ survivors
+  id -u "$1" >/dev/null 2>&1 || return 0
+  for _ in $(seq 1 50); do
+    pgrep -u "$1" >/dev/null 2>&1 || return 0
+    pkill -KILL -u "$1" 2>/dev/null || true
+    sleep 0.1
+  done
+  survivors="$(pgrep -u "$1" 2>/dev/null | tr '\n' ' ')" || true
+  [ -n "${survivors// /}" ] || return 0
+  echo "error: processes of $1 survive repeated KILL: $survivors" >&2
+  return 1
+}
+
 # Echo the live PID for <name> if (and only if) it belongs to our agent module.
 agent_pid() {
   local name="$1" module pid
@@ -82,6 +156,11 @@ start_one() {
 
   pid="$(agent_pid "$name")"
   if [ -n "$pid" ]; then
+    if [ -n "${ISOLATE:-}" ] && ! isolated_pid "$pid" "$name"; then
+      echo "error: $name (pid $pid) is running, but not as sr-$name — run 'scripts/agents.sh restart' to run it" \
+           "isolated (or 'stop')" >&2
+      exit 1
+    fi
     echo "$name already running pid=$pid"
     return 0
   fi
@@ -91,17 +170,37 @@ start_one() {
   mkdir -p "$RUN"
   printf '=== %s start %s (%s) ===\n' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$name" "$module" >>"$log"
+  if [ -n "${ISOLATE:-}" ]; then chmod 0600 "$log"; fi  # an older log may be 0644
 
   (
     cd "$ROOT"
     export PYTHONPATH="$ROOT"
     export PYTHONUNBUFFERED=1
-    nohup "$PYTHON" -m "$module" >>"$log" 2>&1 </dev/null 9>&- &
+    # isolated: the launcher must find isolation on too (a marker gone meanwhile is an error, never "off")
+    if [ -n "${ISOLATE:-}" ]; then export STRANGLER_ISOLATION=on; fi
+    # Isolated, the same command runs through `agents.isolation exec`, which execs (the pid stays the agent's).
+    nohup ${ISOLATE:+"$PYTHON" -m agents.isolation exec "$name" --} "$PYTHON" -m "$module" >>"$log" 2>&1 </dev/null 9>&- &
     printf '%s\n' "$!" >"$(pid_file "$name")"
   )
 
   pid="$(read_pid "$name")"
   sleep 0.5
+  if [ -n "${ISOLATE:-}" ]; then
+    # The root launcher's argv names the module too: wait (<= 30 s) until it has exec'd into sr-<name>.
+    for _ in $(seq 1 150); do
+      if isolated_pid "$pid" "$name" || ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.2
+    done
+    if ! isolated_pid "$pid" "$name"; then
+      if is_agent_pid "$pid" "$module"; then  # never leave it (or its children) running
+        pkill -KILL -P "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      rm -f "$(pid_file "$name")"
+      echo "error: $name did not start as sr-$name; see $log" >&2
+      exit 1
+    fi
+  fi
   if ! is_agent_pid "$pid" "$module"; then
     echo "error: $name failed to start; see $log" >&2
     exit 1
@@ -111,8 +210,17 @@ start_one() {
 
 # Stop all agents: TERM every live one, wait up to 5 s in total, KILL survivors,
 # then remove every PID file. Idempotent; never signals a pid that is not ours.
+# Isolated, the agents' service accounts are swept too, and any survivor makes it
+# fail (every agent is still attempted). Mode unknown: the run directory was not
+# validated, so no pid file is read or removed there; only the accounts are swept.
 stop_all() {
-  local name pid module deadline survivors=()
+  local name pid module deadline survivors=() rc=0
+  if [ -n "${MODE_UNKNOWN:-}" ]; then
+    for name in "${AGENT_NAMES[@]}"; do
+      kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name" || rc=1
+    done
+    return "$rc"
+  fi
   for name in "${AGENT_NAMES[@]}"; do
     pid="$(agent_pid "$name")"
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
@@ -129,22 +237,34 @@ stop_all() {
   for name in "${AGENT_NAMES[@]}"; do
     pid="$(agent_pid "$name")"
     [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+    # Isolated: whatever else runs as sr-<name> goes too.
+    if [ -n "${ISOLATE:-}" ]; then kill_service_user "${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name" || rc=1; fi
     rm -f "$(pid_file "$name")"
   done
+  return "$rc"
 }
 
+# Isolated, an agent counts as running isolated only by the checks start applies.
 status_one() {
   local name="$1" pid
   pid="$(agent_pid "$name")"
-  if [ -n "$pid" ]; then
-    echo "$name running pid=$pid"
-  else
+  if [ -z "$pid" ]; then
     echo "$name stopped"
+  elif [ -z "${ISOLATE:-}" ]; then
+    echo "$name running pid=$pid"
+  elif isolated_pid "$pid" "$name"; then
+    echo "$name running (isolated) pid=$pid"
+  else
+    echo "$name running, NOT isolated — run 'scripts/agents.sh restart' pid=$pid"
   fi
 }
 
 # Serialise start/stop/restart so concurrent invocations cannot spawn untracked duplicates.
 lock() {
+  if [ -n "$MODE_UNKNOWN" ]; then  # the run dir was not validated: never create or open anything in it
+    echo "warning: not taking $RUN/.lock (isolation mode unknown)" >&2
+    return 0
+  fi
   mkdir -p "$RUN"
   exec 9>"$RUN/.lock"
   flock 9
@@ -159,18 +279,26 @@ case "${1:-}" in
     ;;
   stop)
     lock
-    stop_all
+    if ! stop_all; then echo "error: agent service processes survived the stop (see above)" >&2; exit 1; fi
     ;;
   restart)
     lock
-    stop_all
+    if ! stop_all; then
+      echo "error: agent service processes survived the stop (see above); not restarting" >&2
+      exit 1
+    fi
     for name in "${AGENT_NAMES[@]}"; do
       start_one "$name"
     done
     ;;
   status)
     for name in "${AGENT_NAMES[@]}"; do
-      status_one "$name"
+      if [ -n "$MODE_UNKNOWN" ]; then  # no pid file is read from the unvalidated run directory
+        user="${STRANGLER_SERVICE_USER_PREFIX:-sr-}$name"
+        echo "$name: isolation mode unknown; processes of $user: $(pgrep -u "$user" 2>/dev/null | tr '\n' ' ')"
+      else
+        status_one "$name"
+      fi
     done
     ;;
   *)

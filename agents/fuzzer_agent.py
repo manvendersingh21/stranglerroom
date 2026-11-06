@@ -46,7 +46,6 @@ from agents.commands import (
     parse_fuzzer,
 )
 from agents.divergence import (
-    DEFAULT_REGISTRY_PATH,
     RESOLVED_STATUSES,
     CampaignError,
     CampaignReport,
@@ -144,7 +143,7 @@ class FuzzerAgent(RoomAgent):
         super().__init__(**kwargs)
         self.legacy_url = (legacy_url or LEGACY_URL).rstrip("/")
         self.modern_url = (modern_url or MODERN_URL).rstrip("/")
-        self.registry = Registry(registry_path if registry_path is not None else DEFAULT_REGISTRY_PATH)
+        self.registry = Registry(registry_path)  # None: <STRANGLER_STATE_DIR>/fuzzer/divergence_registry.json
         self.n_random = n_random
         self.rev_timeout = rev_timeout
         self.rev_poll = rev_poll

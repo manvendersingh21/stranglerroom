@@ -1,0 +1,24 @@
+{
+  "task_id": "layout-hardening-review-codex",
+  "session": "s-layout-hardening-review-codex-3e4eb6",
+  "ledger": ".hacp/sessions/s-layout-hardening-review-codex-3e4eb6.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-layout-hardening-review-codex-3e4eb6",
+  "revision": "b0f1d67dd6a6305b775a516e31f3512e64ccb6e582461a0300f8760226eacbe5",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/layout-hardening.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/layout-hardening.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/layout-hardening.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

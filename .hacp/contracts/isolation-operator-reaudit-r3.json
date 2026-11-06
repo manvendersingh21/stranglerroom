@@ -1,0 +1,20 @@
+{
+ "task_id": "isolation-operator-reaudit-r3",
+ "peer": "agy",
+ "model": "gemini-3.8-flash-high",
+ "effort": "high",
+ "summary": "re-audit of the operator tools and docs against the final isolation implementation",
+ "prompt": "Read docs/ISOLATION.md and agents/isolation.py (final implementation of per-component OS users), then the operator side: Makefile (targets isolate, isolate-verify, isolate-off, clean-state, demo, e2e), scripts/run_e2e_demo.py, agents/provision.py, scripts/validate_template.py, scripts/bootstrap_switch.sh, .github/workflows/e2e.yml, and README.md (sections 7, 8 'Per-component OS users', 13). Find: (1) any operator step that breaks or misbehaves once isolation is on (files it reads/deletes that moved into /srv/stranglerroom/state, processes it signals, URLs, ordering such as provisioning after the agents start, `make clean-state`, `--fresh` resets); (2) any statement in README.md or docs/ISOLATION.md that the code does not do or does differently (cite both); (3) CI: isolation must stay off for the non-root runner. For each item: file:line, what happens, the minimal fix. Write .hacp/reviews/isolation-operator-reaudit.md with '## Findings' ('None.' if none) and '## Verdict'. Do not modify any other file.",
+ "outputs": [
+  ".hacp/reviews/isolation-operator-reaudit.md"
+ ],
+ "context": [
+  "docs/ISOLATION.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/isolation-operator-reaudit.md",
+  "grep -q '## Verdict' .hacp/reviews/isolation-operator-reaudit.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 2400
+}

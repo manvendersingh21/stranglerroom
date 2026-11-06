@@ -2,7 +2,8 @@
 
 A :class:`RoomAgent` subclass implements :meth:`RoomAgent.handle`. The runtime:
 
-* loads settings, the provisioned room (``.state/room.json``) and this agent's stored credentials;
+* loads its settings (only ``SWITCH_URL``: :meth:`Settings.load_agent`), the provisioned room
+  (``.state/room.json``) and this agent's stored credentials;
 * opens ONE Switch connection (``scope=single&filter=addressed&rooms=<room>``) with 2 s heartbeats;
 * dispatches every *addressed* room message sequentially to ``handle`` — long jobs are fine, the
   stream and heartbeat threads keep the connection alive meanwhile;
@@ -64,7 +65,8 @@ class RoomAgent:
         if not self.name:
             raise TypeError("RoomAgent subclasses must set `name`")
         self.log = logging.getLogger(f"strangler.{self.name}")
-        self.settings = settings or Settings.load()
+        # An agent needs only SWITCH_URL; it never loads the registration token or any admin/human secret.
+        self.settings = settings or Settings.load_agent()
         self.room = room or RoomInfo.load()
         if switch is None:
             creds = AgentCredentials.load(self.name)

@@ -1,0 +1,12 @@
+{
+  "task_id": "isolation-scripts-review-flint",
+  "session": "s-isolation-scripts-review-flint-d70935",
+  "ledger": ".hacp/sessions/s-isolation-scripts-review-flint-d70935.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-isolation-scripts-review-flint-d70935",
+  "revision": "b64984ae208966af5106891ca611f2da686e27f0de0944eda32ef98b6d51e711",
+  "verdict": "escalated",
+  "merged": [],
+  "conflicts": [
+    ".hacp/reviews/isolation-scripts.md"
+  ]
+}

@@ -122,7 +122,7 @@ Faithful web.py shape so @translator can AST-extract it:
 ## 6. Proxy — `targets/proxy/router.py`
 
 ASGI app (no framework required; Starlette OK) + `httpx.AsyncClient` upstream forwarding of method, path, query, body, headers (minus hop-by-hop). Adds response header `X-Strangler-Upstream: legacy|modern`.
-State file `$ROOT/.state/router.json` (`{"target": "legacy"|"modern", "flipped_at": iso|null, "approved_by": str|null, "evidence": str|null}`), default legacy.
+State file `ROUTER_STATE_FILE`, default `<STRANGLER_STATE_DIR or $ROOT/.state>/proxy/router.json` (the proxy's private state directory, created on demand): `{"target": "legacy"|"modern", "flipped_at": iso|null, "approved_by": str|null, "evidence": str|null}`, default legacy.
 Admin (never forwarded): `GET /_router/status` → state + `"upstream_url"`; `POST /_router/flip` with header `X-Router-Token: <token>` (`ROUTER_ADMIN_TOKEN` env if set, else a random per-deployment token generated on first use in `ROUTER_TOKEN_FILE` or `<STRANGLER_STATE_DIR or .state>/router.token`, mode 600 — the same rule in the proxy and @cutover-gate, `targets/common/router_token.py`; there is no public default, and a token file that is not a regular non-symlinked file owned by the current user with no group/other access is refused) and body `{"target": "modern"|"legacy", "approved_by": str, "evidence": str}` → 200 new state; wrong/missing token → 403; bad target → 400. Upstream unreachable → 502 `{"error":"upstream_unavailable"}`.
 
 ## 7. Divergence engine (fuzzer core) — `agents/divergence.py`
@@ -135,7 +135,7 @@ Admin (never forwarded): `GET /_router/status` → state + `"upstream_url"`; `PO
 4. quote endpoint, quantity param parses as int ≤ 0, modern 422 → `non_positive_quantity`
 5. GET and modern 422 and legacy 2xx/4xx(non-422) → `loose_query`
 6. otherwise `unclassified:<method>:<route-template>:<legacy_status>:<modern_status>`
-Cluster IDs (`D-n`) are assigned from a persistent registry (`$ROOT/.state/divergence_registry.json`: tag → ID) in order of first appearance in the deterministic probe corpus, which is ordered D-1…D-5 as in §3, so the five known quirks get D-1..D-5 and anything new gets D-6+.
+Cluster IDs (`D-n`) are assigned from a persistent registry (`<STRANGLER_STATE_DIR or $ROOT/.state>/fuzzer/divergence_registry.json`: tag → ID) in order of first appearance in the deterministic probe corpus, which is ordered D-1…D-5 as in §3, so the five known quirks get D-1..D-5 and anything new gets D-6+.
 
 Decisions: `preserve` → modern must now match legacy exactly for that cluster's probes; `deprecate` → modern's status at discovery for that cluster's probes is the new contract, and the cluster is "approved deviation" iff every divergence of it still has that status AND no corpus probe of that quirk has silently converged back to legacy behaviour (that would be an inconsistent API → `deprecated-violated`).
 "100% Approved Parity (k/k)" ⇔ every cluster ever seen is resolved (preserved+0 diffs, or deprecated+matching) **and** the randomized campaign produced 0 unresolved/unclassified diffs.

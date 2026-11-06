@@ -1,0 +1,24 @@
+{
+  "task_id": "isolation-round2-rereview",
+  "session": "s-isolation-round2-rereview-b38aa7",
+  "ledger": ".hacp/sessions/s-isolation-round2-rereview-b38aa7.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-isolation-round2-rereview-b38aa7",
+  "revision": "f89518fa75321da960d6c50ba160a901a8a47a35fb12026d8b36868e9dde9da8",
+  "verdict": "settled",
+  "merged": [
+    ".hacp/reviews/isolation-round2.md"
+  ],
+  "conflicts": [],
+  "root_checks": [
+    {
+      "check": "grep -q '## Findings' .hacp/reviews/isolation-round2.md",
+      "passed": true,
+      "tail": ""
+    },
+    {
+      "check": "grep -q '## Verdict' .hacp/reviews/isolation-round2.md",
+      "passed": true,
+      "tail": ""
+    }
+  ]
+}

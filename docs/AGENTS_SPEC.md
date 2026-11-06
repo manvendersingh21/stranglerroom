@@ -24,9 +24,13 @@ Everything below marked **(live-verified)** was exercised against the running Sw
 
 ### `agents/switch_client.py`
 `Settings.load()` (env, then `.state/switch.env`): `switch_url, registration_token, admin_email, admin_password,
-mattermost_url, mattermost_team, mattermost_user, mattermost_user_password`.
+mattermost_url, mattermost_team, mattermost_user, mattermost_user_password` — for provisioning, template validation and
+the demo driver. `Settings.load_agent()` is what a room agent uses: only `switch_url` (env `SWITCH_URL`, else the
+public `.state/connection.env` that bootstrap writes beside `switch.env` — URLs only, mode 0644 — else
+`http://127.0.0.1:18000`). It never opens `switch.env`; the other fields are empty strings, and no agent path reads them.
 `register_agent(settings, name, description, display_name) -> AgentCredentials` (reuse stored creds if they still
-authenticate, else `POST /agents` with `overwrite=true`; creds in `.state/agents/<name>.json`, mode 600).
+authenticate, else `POST /agents` with `overwrite=true`; creds in `.state/agents/<name>.json`, mode 600, written
+via a same-directory `mkstemp` file (0600 from creation) + fsync + `os.replace`).
 `SwitchGateway(settings)`: `agents()`, `set_addressing_policy(agent_id, None)`, `room(room_id)`,
 `room_documents(room_id)`, `room_document(room_id, doc_id)` (content included), `validate_template(text)`, `close()`.
 `SwitchAgent(settings, creds)`: `connect([room_id])` (ONE stream `scope=single&filter=addressed&rooms=<room>`,
@@ -87,7 +91,10 @@ router's latest flip, a `rollback` sent before the router's latest flip.
 
 ### `@translator` — `agents/translator_agent.py` (+ `agents/legacy_introspect.py`)
 * Legacy module: `targets/legacy_openlibrary/openlibrary/plugins/openlibrary/lists.py`. Modern output:
-  `targets/modern_fastapi/app/lists.py` (both overridable via constructor args for tests).
+  `targets/modern_fastapi/app/lists.py` (both overridable via constructor args for tests), published atomically with
+  mode 0644 whatever the umask (the modern server may run as another OS user).
+* Governance refusals seen while no ledger exists persist in `STRANGLER_TRANSLATOR_PENDING`, default
+  `<STRANGLER_STATE_DIR>/translator/pending_refusals.json`, and are carried into the next ledger.
 * `migrate <path> from <source> to <target>` — *human-only*. Validate source/target (case-insensitive
   `legacy_openlibrary` → `fastapi`), AST-introspect the legacy module (no import/exec), the path must match one of its
   route templates (else reply with the route table). New migration id `MIG-<UTC yyyymmdd-HHMMSS>`. Post
@@ -124,7 +131,7 @@ router's latest flip, a `rollback` sent before the router's latest flip.
 * On connect: rehydrate the matrix from `MATRIX_DOC` if present.
 * `shadow-test` / `re-verify` (from the translator agent or a human): wait ≤ 30 s for `MODERN_URL/_meta rev == rev`
   (else `⚠️`); `rev` must be the ledger's LATEST build (an older one could never be sealed). New `migration` id →
-  fresh matrix and `Registry().reset()`. Decisions come from the translator's ledger
+  fresh matrix and `Registry().reset()` (default registry file `<STRANGLER_STATE_DIR>/fuzzer/divergence_registry.json`). Decisions come from the translator's ledger
   state (`decisions`); if the handoff carries decisions they must equal the ledger's (else `⚠️` and stop). Run
   `run_campaign(LEGACY_URL, MODERN_URL, {id: {"decision": d}}, n_random=120, registry=Registry())` inside
   `working()`, `add_run`, upsert `MATRIX_DOC`. Post `🔬 Shadow campaign #<n> on rev `<rev>`: <N> requests …` +
@@ -197,7 +204,8 @@ posts one greeting per agent that @-mentions only that agent itself (posted befo
   as a fully redirected background `nohup python -m <module>` (never a wrapper subshell that would hold a capturing
   caller's pipes — the e2e pre-flight captures its output), pid in `.state/run/<name>.pid` = the server itself; `stop`
   signals only a pid whose `/proc/<pid>/cmdline` still holds `-m <module>` (TERM, then KILL after 5 s); `--fresh`
-  fails loud if a port stays occupied by an untracked process instead of reusing it; start/stop are `flock`ed.
+  fails loud if a port stays occupied by an untracked process instead of reusing it, then removes the generated
+  `app/lists.py`, `.state/proxy/router.json` and `.state/fuzzer/divergence_registry.json`; start/stop are `flock`ed.
 * `Makefile`: `install switch-up switch-down targets provision agents agents-stop test test-integration e2e demo cinema
   stop clean-state` (`demo` = switch-up targets(fresh) provision agents e2e). `requirements.txt` pins the venv deps.
 

@@ -1,0 +1,25 @@
+{
+ "task_id": "isolation-round2-rereview",
+ "peer": "codex",
+ "model": "gpt-6.1-sol",
+ "effort": "high",
+ "summary": "re-review of the isolation fixes for the codex and Opus findings",
+ "prompt": "You are an adversarial security reviewer doing a RE-REVIEW. tmp_review/iso_round2.diff is the change that fixes your earlier review (.hacp/reviews/isolation-impl.md) plus an independent review's findings: marker and run-dir paths walked descriptor by descriptor from / (open_trusted_dir), STRANGLER_ISOLATION=on exported for launches, check_link_target for mirrored absolute/relative links, component_instances() process inventory in verify, symlink-following secret scan in the dropped child with visited set and caps, IP-literal-only SWITCH_URL/PROXY_URL/LEGACY_URL/MODERN_URL plus listener-ownership verify rows for 18000 and 9000-9002 in both address families, llm_cli_check, PR_SET_DUMPABLE 0 before/after setresuid, a new session keyring, reset tolerant of planted directories, disable/clean removing key copies, a 13-name locale allowlist, PYTHONSAFEPATH=1, and a fd-based scan walker. agents/isolation.py is the full module after the change. Verify each fix is CORRECT and COMPLETE and look for regressions or new defects: any root filesystem operation that can still follow an attacker-controlled path, TOCTOU windows left in the new walkers, the URL check accepting a name that resolves to ::1, listener checks that miss a squatter, inventory checks that can be evaded, the scan's caps or visited set letting a hit go unreported, and tests that would pass with wrong code. For each finding: severity, file:line, concrete scenario, minimal fix. No style nits. Markdown with '## Findings' ('None.' if none) and '## Verdict'.",
+ "outputs": [
+  ".hacp/reviews/isolation-round2.md"
+ ],
+ "context": [
+  "tmp_review/iso_round2.diff",
+  "agents/isolation.py",
+  "docs/ISOLATION.md",
+  "scripts/agents.sh",
+  "scripts/targets.sh",
+  ".hacp/reviews/isolation-impl.md"
+ ],
+ "acceptance": [
+  "grep -q '## Findings' .hacp/reviews/isolation-round2.md",
+  "grep -q '## Verdict' .hacp/reviews/isolation-round2.md"
+ ],
+ "max_rework": 1,
+ "timeout_s": 2400
+}

@@ -1,0 +1,10 @@
+{
+  "task_id": "isolation-operator-reaudit",
+  "session": "s-isolation-operator-reaudit-e9ae50",
+  "ledger": ".hacp/sessions/s-isolation-operator-reaudit-e9ae50.jsonl",
+  "workspace": "/root/another_hackathon/.hacp/work/s-isolation-operator-reaudit-e9ae50",
+  "revision": "b4c8d8d4a74040f3950b7b37b9e441ef3b1d6eb93d04b988c661e344933a431d",
+  "verdict": "escalated",
+  "merged": [],
+  "conflicts": []
+}

@@ -153,7 +153,7 @@ def render_ledger(state: dict) -> str:
     for r in state["routes"]:
         lines.append(f"| `{r['handler']}` | {', '.join(r['methods'])} | `{_cell(r['legacy_path'])}` | "
                      f"{', '.join(f'`{p}`' for p in r.get('fastapi_paths', [])) or '—'} |")
-    lines += ["", "## 2. Builds of the modern service (`targets/modern_fastapi/app/lists.py`)", "",
+    lines += ["", "## 2. Builds of the modern service (the generated `lists.py` it serves)", "",
               "| Rev | Mode | Policy (per legacy quirk) | Built at | Note |", "|---|---|---|---|---|"]
     for b in state["builds"]:
         policy = ", ".join(f"{t}={d}" for t, d in sorted(b.get("policy", {}).items())) or "naive v1 (textbook port)"

@@ -6,8 +6,9 @@ Run with::
 
 The router forwards every non-admin request to either the legacy web.py
 service or the modern FastAPI service.  The selected target is held in memory
-and persisted to an atomically replaced JSON state file, so a restart keeps the
-last cutover decision.
+and persisted to an atomically replaced JSON state file (``ROUTER_STATE_FILE``, default
+``<STRANGLER_STATE_DIR or .state>/proxy/router.json``), so a restart keeps the last cutover
+decision.
 
 Admin endpoints (never forwarded)::
 
@@ -44,7 +45,15 @@ DEFAULT_PORT = 9000
 DEFAULT_HOST = "127.0.0.1"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_STATE_FILE = REPO_ROOT / ".state" / "router.json"
+
+
+def default_state_file(env: Mapping[str, str] | None = None) -> Path:
+    """The routing state file when ``ROUTER_STATE_FILE`` is unset:
+    ``<STRANGLER_STATE_DIR or <repo>/.state>/proxy/router.json`` (the proxy's private state directory)."""
+    values = os.environ if env is None else env
+    state_dir = (values.get("STRANGLER_STATE_DIR") or "").strip() or str(REPO_ROOT / ".state")
+    return Path(state_dir).expanduser() / "proxy" / "router.json"
+
 
 UPSTREAM_TIMEOUT = httpx.Timeout(30.0)
 
@@ -142,7 +151,7 @@ class RouterConfig:
         values = os.environ if env is None else env
         legacy_url = (values.get("LEGACY_URL") or DEFAULT_LEGACY_URL).rstrip("/")
         modern_url = (values.get("MODERN_URL") or DEFAULT_MODERN_URL).rstrip("/")
-        state_file = Path(values.get("ROUTER_STATE_FILE") or DEFAULT_STATE_FILE).expanduser()
+        state_file = Path(values.get("ROUTER_STATE_FILE") or default_state_file(values)).expanduser()
         # No public default secret, and the SAME rule as @cutover-gate (targets/common/router_token.py).
         admin_token = resolve_router_token(values)
         return cls(
@@ -228,13 +237,37 @@ def _connection_tokens(headers: Iterable[tuple[str, str]]) -> set[str]:
     return tokens
 
 
+#: Session cookies of the human-facing services on this host: Mattermost (the human lead's session) and the
+#: Switch Gateway (the admin's). Browsers scope cookies by host, not by port, so a browser that visits the proxy
+#: on the same host name sends them along. They must never reach an upstream, which serves code the translator
+#: generated (docs/ISOLATION.md §1). Compared case-insensitively.
+CREDENTIAL_COOKIES: frozenset[bytes] = frozenset({b"mmauthtoken", b"mmuserid", b"mmcsrf", b"switch_auth"})
+
+
+def _strip_credential_cookies(value: bytes) -> bytes:
+    """A ``Cookie`` header value without :data:`CREDENTIAL_COOKIES`; the other pairs keep their bytes and order."""
+    kept = [pair for pair in value.split(b";")
+            if pair.strip() and pair.split(b"=", 1)[0].strip().lower() not in CREDENTIAL_COOKIES]
+    return b";".join(kept).strip()
+
+
 def _forward_request_headers(raw_headers: Sequence[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
-    """Strip hop-by-hop and host headers from an incoming request, keeping the raw value bytes
-    (a valid latin-1 byte such as 0xE9 must not turn into an ASCII encoding error)."""
+    """Strip hop-by-hop and host headers, and the credential cookies of :data:`CREDENTIAL_COOKIES`, from an
+    incoming request, keeping the raw value bytes (a valid latin-1 byte such as 0xE9 must not turn into an
+    ASCII encoding error). A ``Cookie`` header left empty is dropped."""
     decoded = [(name.decode("latin-1").lower(), value.decode("latin-1")) for name, value in raw_headers]
     excluded = set(REQUEST_EXCLUDED_HEADERS) | _connection_tokens(decoded)
-    return [(name.lower(), value) for name, value in raw_headers
-            if name.decode("latin-1").lower() not in excluded]
+    forwarded: list[tuple[bytes, bytes]] = []
+    for name, value in raw_headers:
+        lname = name.decode("latin-1").lower()
+        if lname in excluded:
+            continue
+        if lname == "cookie":
+            value = _strip_credential_cookies(value)
+            if not value:
+                continue
+        forwarded.append((name.lower(), value))
+    return forwarded
 
 
 def _forward_response_headers(headers: Iterable[tuple[str, str]]) -> list[tuple[bytes, bytes]]:
@@ -513,7 +546,24 @@ class StranglerRouter:
         )
 
 
-app = StranglerRouter()
+_app: StranglerRouter | None = None
+
+
+def get_app() -> StranglerRouter:
+    """The process-wide router, built on first use rather than at import: building it reads the environment,
+    creates the state directory and may generate the router token, so merely importing this module (tests,
+    tools) must not touch ``.state``."""
+    global _app
+    if _app is None:
+        _app = StranglerRouter()
+    return _app
+
+
+def __getattr__(name: str) -> Any:
+    """Module attribute ``app`` (``uvicorn targets.proxy.router:app``), built lazily by :func:`get_app`."""
+    if name == "app":
+        return get_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -536,7 +586,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(get_app(), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

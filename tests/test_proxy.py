@@ -87,6 +87,24 @@ def test_shared_client_never_leaks_cookies_between_callers(stack):
     assert own.json()["cookie"] == "mine=1"
 
 
+@pytest.mark.parametrize("sent, forwarded", [
+    ("a=1; MMAUTHTOKEN=human-session; b=2", "a=1; b=2"),
+    ("MMAUTHTOKEN=s; MMUSERID=u; MMCSRF=c; switch_auth=admin", None),   # nothing left: no Cookie header at all
+    ("switch_auth=admin; keep=yes", "keep=yes"),
+    ("mmauthtoken=s;x=1", "x=1"),                                      # names compared case-insensitively
+    ("a=1; b=MMAUTHTOKEN", "a=1; b=MMAUTHTOKEN"),                      # only the cookie NAME matters
+])
+def test_credential_cookies_never_reach_an_upstream(stack, sent, forwarded):
+    """Browsers scope cookies by host, not port: the human's Mattermost session and the Gateway admin's cookie
+    arrive at the proxy too, and must not reach the upstream (which serves translator-generated code)."""
+    pu, _ = stack
+    for target in ("legacy", "modern"):
+        if target == "modern":
+            assert _flip(pu, target="modern", approved_by="user", evidence="x").status_code == 200
+        body = httpx.get(pu + "/x", headers={"Cookie": sent}).json()
+        assert body["served_by"] == target and body["cookie"] == forwarded, (target, body)
+
+
 @pytest.mark.parametrize("target", [[], {}, 1, None])
 def test_flip_rejects_non_string_target(stack, target):
     pu, _ = stack
